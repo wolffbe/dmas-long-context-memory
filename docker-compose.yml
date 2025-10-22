@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  locomo:
+    build:
+      context: ./locomo
+      dockerfile: Dockerfile
+    container_name: locomo
+    ports:
+      - "8002:8000"
+    volumes:
+      - locomo-data:/data
+    environment:
+      - DATA_URL=https://raw.githubusercontent.com/snap-research/locomo/refs/heads/main/data/locomo10.json
+    networks:
+      - dmas-network
+
+volumes:
+  locomo-data:
+
+networks:
+  dmas-network:
+    driver: bridge
