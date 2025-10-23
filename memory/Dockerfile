@@ -9,6 +9,9 @@ RUN apt-get update && \
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY locomo.py .
-EXPOSE 8000
-CMD ["uvicorn", "locomo:app", "--host", "0.0.0.0", "--port", "8000"]
+
+COPY memory.py .
+
+EXPOSE 8002
+
+CMD ["python", "memory.py"]

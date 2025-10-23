@@ -1,5 +1,4 @@
 version: '3.8'
-
 services:
   locomo:
     build:
@@ -14,9 +13,108 @@ services:
       - DATA_URL=https://raw.githubusercontent.com/snap-research/locomo/refs/heads/main/data/locomo10.json
     networks:
       - dmas-network
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  memory:
+    build:
+      context: ./memory
+      dockerfile: Dockerfile
+    container_name: memory
+    ports:
+      - "8005:8005"
+    environment:
+      - MEMORY_BACKEND=mem0
+    volumes:
+      - memory-data:/data/chroma
+    networks:
+      - dmas-network
+    deploy:
+      resources:
+        limits:
+          memory: 7G
+        reservations:
+          memory: 4G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  coordinator:
+    build:
+      context: ./coordinator
+      dockerfile: Dockerfile
+    container_name: coordinator
+    ports:
+      - "8003:8001"
+    depends_on:
+      locomo:
+        condition: service_healthy
+      memory:
+        condition: service_healthy
+      responder:
+        condition: service_healthy
+    environment:
+      - API_URL=http://locomo:8000
+      - MEMORY_URL=http://memory:8005
+      - RESPONDER_URL=http://responder:8006
+      - MODEL=llama3.2:3b
+      - NUM_CTX=512
+    networks:
+      - dmas-network
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  responder:
+    build:
+      context: ./responder
+      dockerfile: Dockerfile
+    container_name: responder
+    ports:
+      - "8006:8006"
+    environment:
+      - MODEL=llama3.2:8b
+      - NUM_CTX=4096
+    networks:
+      - dmas-network
+    deploy:
+      resources:
+        limits:
+          memory: 7G
+        reservations:
+          memory: 4G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 volumes:
   locomo-data:
+  memory-data:
 
 networks:
   dmas-network:
