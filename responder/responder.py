@@ -24,10 +24,10 @@ class Responder:
             
             prompt = f"""Based on the following context, answer the question.
 
-Context:
+CONTEXT:
 {context}
 
-Question: {question}
+QUESTION: {question}
 
 Answer:"""
             

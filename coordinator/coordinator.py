@@ -21,6 +21,7 @@ class Coordinator:
         self.memory_url = memory_url
         self.responder_url = responder_url
         self.model = model
+        self.context = None
    
     def load_conversation(self, conv_index: int) -> dict:        
         try:
@@ -130,22 +131,25 @@ class Coordinator:
                     return {"error": result.get("error")}
                 
                 context = result.get("context", "")
-                if not context:
-                    return {"context": "No relevant information found."}
                 
-                return {"context": context}
+                if context:
+                    self.context = context
+                    return {"context": "cached"}
+                else:
+                    self.context = ""
+                    return {"context": "none"}
+                
             except Exception as e:
                 return {"error": str(e)}
         
         elif tool_name == "respond":
             question = arguments["question"]
-            context = arguments["context"]
             try:
                 response = requests.post(
                     f"{self.responder_url}/respond",
                     json={
                         "question": question,
-                        "context": context
+                        "context": self.context
                     },
                     timeout=30
                 )
@@ -216,7 +220,7 @@ First use remember to get context, then use respond to get the final answer."""
             
             return {
                 "status": "error",
-                "error": "Max iterations reached"
+                "error": "no response after five attempts"
             }
             
         except Exception as e:
