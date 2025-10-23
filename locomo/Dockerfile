@@ -1,7 +1,6 @@
 FROM python:3.10-slim
 WORKDIR /app
 
-# Install curl for healthcheck
 RUN apt-get update && \
     apt-get install -y curl && \
     apt-get clean && \

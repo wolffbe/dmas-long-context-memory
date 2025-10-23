@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   locomo:
     build:
@@ -17,19 +15,25 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 768M
         reservations:
-          memory: 512M
+          memory: 384M
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 60s
+    profiles:
+      - mem0
+      - graphiti
 
   qdrant:
     image: qdrant/qdrant:latest
     container_name: qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
     volumes:
       - qdrant-data:/qdrant/storage
     networks:
@@ -37,35 +41,78 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
+          memory: 1536M
         reservations:
-          memory: 1G
+          memory: 768M
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
       interval: 10s
       timeout: 5s
       retries: 3
       start_period: 10s
+    restart: unless-stopped
+    profiles:
+      - mem0
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
+  neo4j:
+    image: neo4j:5.15
+    container_name: neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/password
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      - NEO4J_dbms_memory_heap_max__size=1536M
+      - NEO4J_dbms_memory_pagecache_size=768M
     volumes:
-      - ollama-data:/root/.ollama
+      - neo4j-data:/data
+      - neo4j-logs:/logs
     networks:
       - memory-internal
     deploy:
       resources:
         limits:
-          memory: 8G
+          memory: 3G
         reservations:
-          memory: 4G
+          memory: 1536M
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "password", "RETURN 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+    profiles:
+      - graphiti
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - memory-internal
+      - dmas-network
+    deploy:
+      resources:
+        limits:
+          memory: 7G
+        reservations:
+          memory: 3584M
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
       interval: 10s
       timeout: 5s
       retries: 3
       start_period: 30s
+    restart: unless-stopped
+    profiles:
+      - mem0
+      - graphiti
 
   memory:
     build:
@@ -75,18 +122,26 @@ services:
     ports:
       - "8005:8005"
     depends_on:
-      qdrant:
-        condition: service_healthy
       ollama:
         condition: service_healthy
+      qdrant:
+        condition: service_healthy
+        required: false
+      neo4j:
+        condition: service_healthy
+        required: false
     environment:
       - MEMORY_BACKEND=mem0
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=llama3.3:latest
+      - OLLAMA_EMBED_MODEL=nomic-embed-text:latest
+      - EMBEDDING_DIMS=768
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
       - QDRANT_COLLECTION=conversations
-      - OLLAMA_BASE_URL=http://ollama:11434
-      - OLLAMA_MODEL=llama3.1:latest
-      - OLLAMA_EMBED_MODEL=nomic-embed-text:latest
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=password
     volumes:
       - memory-data:/data
     networks:
@@ -95,15 +150,19 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 1536M
         reservations:
-          memory: 2G
+          memory: 768M
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
       interval: 10s
       timeout: 5s
       retries: 3
       start_period: 30s
+    restart: unless-stopped
+    profiles:
+      - mem0
+      - graphiti
 
   coordinator:
     build:
@@ -123,6 +182,7 @@ services:
       - API_URL=http://locomo:8000
       - MEMORY_URL=http://memory:8005
       - RESPONDER_URL=http://responder:8006
+      - OLLAMA_BASE_URL=http://ollama:11434
       - MODEL=llama3.2:3b
       - NUM_CTX=512
     networks:
@@ -130,15 +190,19 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 768M
         reservations:
-          memory: 512M
+          memory: 384M
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
+    profiles:
+      - mem0
+      - graphiti
 
   responder:
     build:
@@ -148,33 +212,39 @@ services:
     ports:
       - "8006:8006"
     environment:
-      - MODEL=llama3.2:8b
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - MODEL=llama3.3:latest
       - NUM_CTX=4096
     networks:
       - dmas-network
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 1536M
         reservations:
-          memory: 2G
+          memory: 768M
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
       interval: 10s
       timeout: 5s
       retries: 3
       start_period: 30s
+    restart: unless-stopped
+    profiles:
+      - mem0
+      - graphiti
 
 volumes:
   locomo-data:
   memory-data:
   qdrant-data:
   ollama-data:
+  neo4j-data:
+  neo4j-logs:
 
 networks:
   memory-internal:
     driver: bridge
     internal: false
-  
   dmas-network:
     driver: bridge

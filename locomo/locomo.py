@@ -302,7 +302,6 @@ class ChatStorage:
             "data_file": str(self.data_path)
         }
 
-# Initialize storage
 storage = ChatStorage(
     data_url=os.getenv("DATA_URL", "https://raw.githubusercontent.com/snap-research/locomo/refs/heads/main/data/locomo10.json")
 )

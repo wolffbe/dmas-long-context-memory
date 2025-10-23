@@ -220,7 +220,8 @@ First use remember to get context, then use respond to get the final answer."""
             
             return {
                 "status": "error",
-                "error": "no response after five attempts"
+                "error": "no response after five attempts",
+                "answer": "none"
             }
             
         except Exception as e:
