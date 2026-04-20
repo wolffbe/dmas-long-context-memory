@@ -1,11 +1,25 @@
 import json
+import os
 import requests
 from typing import Dict, Any, List
 from openai import OpenAI
 import logging
-import os
 
 logger = logging.getLogger(__name__)
+
+
+def _make_windows(turns: list, window_size: int) -> list:
+    """Split a turn list into overlapping windows for fair memory ingestion.
+
+    window_size=0  → single window (all turns at once, legacy behaviour).
+    window_size=W  → for each turn i, window = turns[max(0,i-W+1) : i+1].
+    This mirrors the Mem0 paper (m=10) and Zep/Graphiti paper (n=4) ingestion strategy:
+    each message is stored WITH its preceding W-1 messages as context.
+    """
+    if window_size <= 0 or window_size >= len(turns):
+        return [turns]
+    return [turns[max(0, i - window_size + 1): i + 1] for i in range(len(turns))]
+
 
 class CoordinatorService:    
     
@@ -62,42 +76,47 @@ class CoordinatorService:
             )
             response.raise_for_status()
             conversation_data = response.json()
-            
+
             sessions = conversation_data.get("sessions", {})
             session_datetimes = conversation_data.get("session_datetimes", {})
-            
+
             session_key = f"session_{session_id}"
             session_date_key = f"session_{session_id}_date_time"
-            
+
             if session_key not in sessions:
                 return {
                     "status": "error",
                     "error": f"Session {session_id} not found in conversation {conversation_id}"
                 }
-            
-            filtered_data = {
-                "speaker_a": conversation_data.get("speaker_a"),
-                "speaker_b": conversation_data.get("speaker_b"),
-                "sessions": {
-                    session_key: sessions[session_key]
-                },
-                "session_datetimes": {
-                    session_date_key: session_datetimes.get(session_date_key)
-                }
-            }
-            
-            memory_response = requests.post(
-                f"{self.memory_url}/memorize",
-                json={
-                    "conv_index": conversation_id,
-                    "data": filtered_data
-                }
+
+            window_size = int(os.getenv("MEMORY_WINDOW_SIZE", "0"))
+            turns = sessions[session_key]
+            windows = _make_windows(turns, window_size)
+
+            logger.info(
+                "Session %s: %d turns → %d window(s) (MEMORY_WINDOW_SIZE=%d)",
+                session_key, len(turns), len(windows), window_size,
             )
-            memory_response.raise_for_status()
-            result = memory_response.json()
-            
-            return result
-            
+
+            last_result = {}
+            for window in windows:
+                filtered_data = {
+                    "speaker_a": conversation_data.get("speaker_a"),
+                    "speaker_b": conversation_data.get("speaker_b"),
+                    "sessions": {session_key: window},
+                    "session_datetimes": {
+                        session_date_key: session_datetimes.get(session_date_key)
+                    },
+                }
+                memory_response = requests.post(
+                    f"{self.memory_url}/memorize",
+                    json={"conv_index": conversation_id, "data": filtered_data},
+                )
+                memory_response.raise_for_status()
+                last_result = memory_response.json()
+
+            return {**last_result, "windows_sent": len(windows)}
+
         except Exception as e:
             return {
                 "status": "error",
@@ -289,7 +308,8 @@ class CoordinatorService:
                 return {
                     "status": "success",
                     "answer": final_answer,
-                    "iterations": iteration
+                    "iterations": iteration,
+                    "memory_retrieved": self.memory or "",
                 }
             else:
                 return {

@@ -149,15 +149,23 @@ services:
           sleep 2
         done
 
-        echo "Ollama server is ready, pulling model..."
-        ollama pull ${OLLAMA_MODEL}
+        echo "Ollama server is ready, pulling models..."
+        for MODEL in ${OLLAMA_MODELS}; do
+          if ollama list | grep -q "$$MODEL"; then
+            echo "Model $$MODEL already present, skipping pull."
+          else
+            echo "Pulling $$MODEL..."
+            ollama pull $$MODEL
+          fi
+        done
 
-        echo "Model pulled successfully"
+        echo "All models ready."
         wait $$OLLAMA_PID
     networks:
       - dmas-network
     environment:
       - OLLAMA_MODEL=${OLLAMA_MODEL}
+      - OLLAMA_MODELS=${OLLAMA_MODELS}
     healthcheck:
       test: ["CMD-SHELL", "ollama list | grep -q '${OLLAMA_MODEL}'"]
       interval: 5s
@@ -167,9 +175,13 @@ services:
     deploy:
       resources:
         limits:
-          memory: 12G
-        reservations:
           memory: 6G
+        reservations:
+          memory: 2G
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     restart: unless-stopped
     labels:
       - "group=edge"

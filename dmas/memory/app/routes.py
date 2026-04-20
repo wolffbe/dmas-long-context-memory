@@ -1,10 +1,9 @@
+import importlib
 import os
 from typing import Dict, Any, Optional
 import uvicorn
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
-from app.services.mem0_service import Mem0Service
-from app.services.graphiti_service import GraphitiService
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -12,12 +11,21 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="memory", version="1.0")
 
-if os.getenv("MEMORY_BACKEND", "").lower() == "graphiti":
-    graphiti = GraphitiService()
-    memory_backend = graphiti
-else:
-    mem0 = Mem0Service()
-    memory_backend = mem0
+_BACKEND_REGISTRY = {
+    "mem0":         ("app.services.mem0_service",         "Mem0Service"),
+    "graphiti":     ("app.services.graphiti_service",     "GraphitiService"),
+    "rag":          ("app.services.rag_service",          "RagService"),
+    "full_context": ("app.services.full_context_service", "FullContextService"),
+}
+_DEFAULT_BACKEND = "mem0"
+
+def _create_backend(name: str):
+    module_path, class_name = _BACKEND_REGISTRY.get(name, _BACKEND_REGISTRY[_DEFAULT_BACKEND])
+    module = importlib.import_module(module_path)
+    logger.info("Loading memory backend: %s", class_name)
+    return getattr(module, class_name)()
+
+memory_backend = _create_backend(os.getenv("MEMORY_BACKEND", "").lower())
 
 def get_mem_backend() -> Any:
     return memory_backend

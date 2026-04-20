@@ -3,12 +3,9 @@ import os
 import pandas as pd
 import re
 import requests
-import shutil
 import subprocess
 import time
 
-from difflib import SequenceMatcher
-from sentence_transformers import SentenceTransformer, util
 
 print("\n" + "="*60)
 print("LOADING ENVIRONMENT VARIABLES")
@@ -32,8 +29,6 @@ COORDINATOR_URL = os.getenv("COORDINATOR_URL")
 print(f"COORDINATOR_URL: {COORDINATOR_URL if COORDINATOR_URL else 'NOT SET'}")
 
 print("="*60 + "\n")
-
-_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 TOXIC_LATENCY = 0
 TOXIC_JITTER = 0
@@ -191,6 +186,70 @@ def verify_memory_backend():
     
     print(f"✓ MEMORY_BACKEND correctly set to '{memory_backend}' in memory container\n")
 
+
+def wait_for_graphiti_warmup(
+    backend: str,
+    poll_interval: int = 30,
+    idle_threshold: float = 1e8,
+    consecutive_idle: int = 3,
+) -> float:
+    """Wait for Graphiti/Neo4j background graph-building to complete.
+
+    Polls Prometheus for cloud-group CPU usage. When the value stays below
+    idle_threshold for `consecutive_idle` consecutive polls, background
+    processing is considered complete.
+
+    Returns elapsed_seconds (float) — a measurable result for the paper:
+    graph databases require significant async processing after ingestion,
+    making them impractical for real-time DMAS scenarios.
+
+    For non-Graphiti backends returns 0.0 immediately.
+    """
+    if backend.lower() != "graphiti":
+        print(f"Backend is '{backend}' — no warmup needed.")
+        return 0.0
+
+    if not PROMETHEUS_QUERY_URL:
+        print("PROMETHEUS_URL not set — cannot monitor warmup. Add a manual delay.")
+        return 0.0
+
+    # Cloud-group covers Neo4j and the Graphiti memory container
+    cpu_query = 'sum(rate(docker_container_cpu_usage_total{group="cloud"}[30s]))'
+
+    print("Waiting for Graphiti/Neo4j background processing to complete...")
+    print(f"Polling every {poll_interval}s — idle threshold: {idle_threshold:.0e}, "
+          f"required consecutive idle checks: {consecutive_idle}")
+
+    start_time = time.time()
+    idle_count = 0
+
+    while True:
+        try:
+            r = requests.get(PROMETHEUS_QUERY_URL, params={"query": cpu_query}, timeout=10)
+            cpu_val = 0.0
+            if r.status_code == 200:
+                data = r.json()
+                if data["data"]["result"]:
+                    cpu_val = float(data["data"]["result"][0]["value"][1])
+        except Exception as e:
+            print(f"  Prometheus query error: {e}")
+            cpu_val = float("inf")
+
+        elapsed = time.time() - start_time
+        print(f"  [{elapsed:6.0f}s] cloud CPU rate: {cpu_val:.2e}")
+
+        if cpu_val < idle_threshold:
+            idle_count += 1
+            if idle_count >= consecutive_idle:
+                elapsed = time.time() - start_time
+                print(f"\n✓ Graphiti warmup complete — elapsed: {elapsed:.0f}s ({elapsed/60:.1f} min)")
+                return elapsed
+        else:
+            idle_count = 0
+
+        time.sleep(poll_interval)
+
+
 def check_toxics(PROFILE, TOXIPROXY_URL):
     print("\nVerifying toxic configuration...")
     try:
@@ -327,7 +386,7 @@ def get_openai_cost(start, end, pricing_file="openai_prices.json", tier="standar
         traceback.print_exc()
         return 0
 
-def measure_function(func, *args, min_duration=15, **kwargs):
+def measure_function(func, *args, min_duration=5, **kwargs):
     print("\n" + "-"*60)
     print(f"Starting measurement for function '{func.__name__}'")
     print("-"*60)
@@ -400,21 +459,55 @@ def measure_function(func, *args, min_duration=15, **kwargs):
 
 def load_session(session_id, conversation_index):
     print(f"Loading session {session_id} for conversation {conversation_index}")
-    requests.post(f"{COORDINATOR_URL}/conversation/load/{conversation_index}/session/{session_id}")
+    resp = requests.post(f"{COORDINATOR_URL}/conversation/load/{conversation_index}/session/{session_id}")
+    resp.raise_for_status()
+    result = resp.json()
+    added = result.get("added", 0)
+    failed = result.get("failed", 0)
+    status = result.get("status", "unknown")
+    print(f"  → status={status}, added={added}, failed={failed}")
+    if added == 0 and failed > 0:
+        raise RuntimeError(f"Session {session_id} stored 0 memories ({failed} failures). Check memory service logs.")
+
+def _sessions_output_path(MEMORY_BACKEND, conversation_index):
+    is_constrained = any(
+        int(os.getenv(var, 0)) > 0 for var in [
+            "TOXIC_LATENCY", "TOXIC_JITTER", "TOXIC_BANDWIDTH",
+            "TOXIC_SLOW_CLOSE", "TOXIC_TIMEOUT", "TOXIC_SLICER",
+            "TOXIC_LIMIT_DATA", "TOXIC_RESET_PEER"
+        ]
+    )
+    fname = f"{MEMORY_BACKEND}{_model_tag()}_conv_{conversation_index}_sessions{'_constrained' if is_constrained else ''}.csv"
+    return os.path.join("results", fname)
+
 
 def load_memories(sessions, conversation_index, MEMORY_BACKEND):
     print(f"\nLOADING MEMORIES: {sessions} session(s)")
     print(f"Backend: {MEMORY_BACKEND}, Conversation: {conversation_index}")
     print("="*60 + "\n")
-    
-    memories = []
+
     num_sessions = max(1, sessions)
-    
+    os.makedirs("results", exist_ok=True)
+    output_path = _sessions_output_path(MEMORY_BACKEND, conversation_index)
+
+    done_sessions = set()
+    write_header = True
+    if os.path.exists(output_path):
+        existing = pd.read_csv(output_path)
+        done_sessions = set(existing["session_id"].astype(int).tolist())
+        write_header = False
+        print(f"Checkpoint found: sessions {sorted(done_sessions)} already loaded, resuming.\n")
+
     for i in range(1, num_sessions + 1):
+        if i in done_sessions:
+            print(f"Session {i}/{num_sessions}: already loaded, skipping.")
+            continue
+
         print(f"\nLoading session {i}/{num_sessions}")
         output = measure_function(load_session, i, conversation_index)
         row = {
             "memory": MEMORY_BACKEND,
+            "ollama_model": os.getenv("OLLAMA_MODEL", ""),
             "time": time.time(),
             "conversation_index": conversation_index,
             "session_id": i,
@@ -428,24 +521,26 @@ def load_memories(sessions, conversation_index, MEMORY_BACKEND):
             "toxic_limit_data": os.getenv("TOXIC_LIMIT_DATA", ""),
             "toxic_reset_peer": os.getenv("TOXIC_RESET_PEER", "")
         }
-        print(f"Session {i} metrics: {row}")
-        memories.append(row)
-    
-    print("\n" + "="*60)
-    print(f"COMPLETED LOADING {len(memories)} SESSION(S)")
-    print("="*60 + "\n")
-    return memories
+        pd.DataFrame([row]).to_csv(output_path, mode="a", header=write_header, index=False)
+        write_header = False
 
-def export_loaded_memory_metrics(memories, MEMORY_BACKEND, conversation_index):
-    if not memories:
-        print("No memories to save.")
-        return
-    
-    print(f"Exporting {len(memories)} memory metric(s)...")
-    df = pd.DataFrame(memories)
-    output_dir = "results"
-    os.makedirs(output_dir, exist_ok=True)
-    
+    print("\n" + "="*60)
+    print(f"COMPLETED LOADING {num_sessions} SESSION(S) → {output_path}")
+    print("="*60 + "\n")
+    return pd.read_csv(output_path).to_dict("records")
+
+def _sanitize_model(model: str) -> str:
+    return re.sub(r'[:/]', '-', model).strip('-')
+
+
+def _model_tag() -> str:
+    model = _sanitize_model(os.getenv("OLLAMA_MODEL", ""))
+    return f"_{model}" if model else ""
+
+
+
+
+def _qa_output_path(MEMORY_BACKEND, conversation_index):
     is_constrained = any(
         int(os.getenv(var, 0)) > 0 for var in [
             "TOXIC_LATENCY", "TOXIC_JITTER", "TOXIC_BANDWIDTH",
@@ -453,70 +548,60 @@ def export_loaded_memory_metrics(memories, MEMORY_BACKEND, conversation_index):
             "TOXIC_LIMIT_DATA", "TOXIC_RESET_PEER"
         ]
     )
-    print(f"Constrained mode: {is_constrained}")
-    
-    output_file = f"{MEMORY_BACKEND}_conv_{conversation_index}_sessions{'_constrained' if is_constrained else ''}.csv"
-    output_path = os.path.join(output_dir, output_file)
-    
-    if os.path.exists(output_path):
-        backup_file = f"{MEMORY_BACKEND}_conv_{conversation_index}_sessions{'_constrained' if is_constrained else ''}_backup.csv"
-        backup_path = os.path.join(output_dir, backup_file)
-        shutil.move(output_path, backup_path)
-        print(f"Existing file backed up to {backup_path}")
-    
-    df.to_csv(output_path, index=False)
-    print(f"✓ Saved new results to {output_path}\n")
-    
-def check_similarity_string(text1: str, text2: str) -> float:
-    if not text1 or not text2:
-        return 0.0
-    return SequenceMatcher(None, text1.lower(), text2.lower()).ratio()
+    fname = f"{MEMORY_BACKEND}{_model_tag()}_conv_{conversation_index}_qa{'_constrained' if is_constrained else ''}.csv"
+    return os.path.join("results", fname)
 
-def check_similarity_semantic(text1: str, text2: str) -> float:
-    if not text1 or not text2:
-        return 0.0
-    emb1 = _model.encode(text1, convert_to_tensor=True)
-    emb2 = _model.encode(text2, convert_to_tensor=True)
-    return float(util.cos_sim(emb1, emb2).item())
 
-def run_qa(questions, MEMORY_BACKEND, CONVERSATION_INDEX, PROFILE):
+def run_qa(questions, MEMORY_BACKEND, CONVERSATION_INDEX, PROFILE, log_retrieved_memory=False):
     print("\n" + "="*60)
     print("RUNNING Q&A SESSION")
     print("="*60)
-    
-    qa = []
-    total_questions = len(questions.get("questions", []))
-    print(f"Total questions: {total_questions}\n")
-    
+
+    all_questions = questions.get("questions", [])
+    total_questions = len(all_questions)
+    print(f"Total questions: {total_questions}")
+
+    os.makedirs("results", exist_ok=True)
+    output_path = _qa_output_path(MEMORY_BACKEND, CONVERSATION_INDEX)
+
+    # Resume: skip already-answered questions
+    done = 0
+    write_header = True
+    if os.path.exists(output_path):
+        existing = pd.read_csv(output_path)
+        done = len(existing)
+        write_header = False
+        print(f"Checkpoint found: {done}/{total_questions} already done, resuming.\n")
+    else:
+        print()
+
     def ask(question):
         resp = requests.post(f"{COORDINATOR_URL}/ask", params={"question": question})
-        return resp.json().get("answer")
-    
-    for idx, question in enumerate(questions.get("questions", []), start=1):
+        return resp.json()
+
+    for idx, question in enumerate(all_questions, start=1):
+        if idx <= done:
+            continue
+
         print(f"\nQuestion {idx}/{total_questions}: {question.get('question')}")
         output = measure_function(ask, question.get("question"))
-        print(f"Answer: {output['result']}")
-        
-        answer_received = output["result"]
+        answer_received = output["result"].get("answer") if isinstance(output["result"], dict) else output["result"]
+        memory_retrieved = output["result"].get("memory_retrieved", "") if isinstance(output["result"], dict) else ""
+        print(f"Answer: {answer_received}")
         metrics = output.get("metrics", {})
-        
-        similarity_string = check_similarity_string(question.get("answer"), answer_received)
-        similarity_semantic = check_similarity_semantic(question.get("answer"), answer_received)
-        
-        print(f"Similarity (string): {similarity_string:.3f}")
-        print(f"Similarity (semantic): {similarity_semantic:.3f}")
-        print(f"Similarity (average): {(similarity_string + similarity_semantic) / 2:.3f}")
-        
+
+        category_int = question.get("category")
         row = {
             "memory": MEMORY_BACKEND,
+            "ollama_model": os.getenv("OLLAMA_MODEL", ""),
             "time": time.time(),
             "conversation_index": CONVERSATION_INDEX,
             "question": question.get("question"),
             "answer_actual": question.get("answer"),
             "answer_received": answer_received,
-            "similarity_string": similarity_string,
-            "similarity_semantic": similarity_semantic,
-            "similarity": (similarity_string + similarity_semantic) / 2,
+            "category": category_int,
+            "is_adversarial": category_int == 5,
+            **({"memory_retrieved": memory_retrieved} if log_retrieved_memory else {}),
             **metrics,
             "toxic_latency": PROFILE["TOXIC_LATENCY"],
             "toxic_jitter": PROFILE["TOXIC_JITTER"],
@@ -527,42 +612,14 @@ def run_qa(questions, MEMORY_BACKEND, CONVERSATION_INDEX, PROFILE):
             "toxic_limit_data": PROFILE["TOXIC_LIMIT_DATA"],
             "toxic_reset_peer": PROFILE["TOXIC_RESET_PEER"],
         }
-        
-        qa.append(row)
-    
-    print("\n" + "="*60)
-    print(f"COMPLETED Q&A: {len(qa)} QUESTIONS")
-    print("="*60 + "\n")
-    
-    return qa
 
-def export_qa(qa, MEMORY_BACKEND, conversation_index):
-    if not qa:
-        print("No QA results to save.")
-        return
-    
-    print(f"Exporting {len(qa)} QA result(s)...")
-    df = pd.DataFrame(qa)
-    output_dir = "results"
-    os.makedirs(output_dir, exist_ok=True)
-    
-    is_constrained = any(
-        int(os.getenv(var, 0)) > 0 for var in [
-            "TOXIC_LATENCY", "TOXIC_JITTER", "TOXIC_BANDWIDTH",
-            "TOXIC_SLOW_CLOSE", "TOXIC_TIMEOUT", "TOXIC_SLICER",
-            "TOXIC_LIMIT_DATA", "TOXIC_RESET_PEER"
-        ]
-    )
-    print(f"Constrained mode: {is_constrained}")
-    
-    output_file = f"{MEMORY_BACKEND}_conv_{conversation_index}_qa{'_constrained' if is_constrained else ''}.csv"
-    output_path = os.path.join(output_dir, output_file)
-    
-    if os.path.exists(output_path):
-        backup_file = f"{MEMORY_BACKEND}_conv_{conversation_index}_qa{'_constrained' if is_constrained else ''}_backup.csv"
-        backup_path = os.path.join(output_dir, backup_file)
-        shutil.move(output_path, backup_path)
-        print(f"Existing file backed up to {backup_path}")
-    
-    df.to_csv(output_path, index=False)
-    print(f"✓ Saved new QA results to {output_path}\n")
+        pd.DataFrame([row]).to_csv(output_path, mode="a", header=write_header, index=False)
+        write_header = False
+
+    total_done = done + (total_questions - done)
+    print("\n" + "="*60)
+    print(f"COMPLETED Q&A: {total_done} QUESTIONS → {output_path}")
+    print("="*60 + "\n")
+
+    return pd.read_csv(output_path).to_dict("records")
+

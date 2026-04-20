@@ -5,3 +5,4 @@ openai>=2.6.1
 mem0ai==1.0.0
 graphiti-core==0.22.0
 python-dotenv==1.2.1
+qdrant-client>=1.7.0

@@ -17,3 +17,7 @@ __pycache__/
 logs
 
 batch_runs
+
+.claude/
+papers/
+analysis/results/
