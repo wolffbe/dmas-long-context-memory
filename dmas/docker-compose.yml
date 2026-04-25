@@ -1,228 +1,472 @@
-name: dmas-long-context-memory
+name: dmas
+
+x-agent-base: &agent-base
+  image: dmas/agent:latest
+  restart: unless-stopped
+
 services:
-  toxiproxy:
-    image: ghcr.io/shopify/toxiproxy:latest
-    container_name: toxiproxy
-    networks:
-      - dmas-network
-    ports:
-      - "127.0.0.1:8474:8474"
-      - "127.0.0.1:8005:18005" # listen to Memory
-      - "127.0.0.1:8006:18006" # listen to Responder
-      - "127.0.0.1:8007:18007" # Listen to Locomo
-    command: ["-host=0.0.0.0"]
+  # ---------------- shared infra ----------------
+  qdrant-1:
+    image: qdrant/qdrant:v1.12.4
+    container_name: dmas-qdrant-1
     restart: unless-stopped
-    labels:
-      - "group=cloud"
-
-  locomo:
-    build:
-      context: ./locomo
-      dockerfile: Dockerfile
-    container_name: locomo
-    # Port exposed only via toxiproxy (host 8004 -> toxiproxy 18004 -> locomo 8000)
-    environment:
-      - DATA_URL=https://raw.githubusercontent.com/snap-research/locomo/refs/heads/main/data/locomo10.json
-    networks:
-      - dmas-network
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 256M
-    restart: unless-stopped
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: qdrant
-    ports:
-      - "127.0.0.1:6333:6333"
-      - "127.0.0.1:6334:6334"
-    volumes:
-      - qdrant-data:/qdrant/storage
-    networks:
-      - memory-internal
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-        reservations:
-          memory: 1G
-    restart: unless-stopped
-    labels:
-      - "group=cloud"
-  neo4j:
-    image: neo4j:5.26
-    container_name: neo4j
-    ports:
-      - "127.0.0.1:7474:7474"
-      - "127.0.0.1:7687:7687"
-    environment:
-      - NEO4J_AUTH=neo4j/password
-      - NEO4J_PLUGINS=["apoc"]
-      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
-      - NEO4J_dbms_memory_heap_max__size=512M
-      - NEO4J_dbms_memory_pagecache_size=256M
-    volumes:
-      - neo4j-data:/data
-      - neo4j-logs:/logs
-    networks:
-      - memory-internal
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-        reservations:
-          memory: 1G
-    restart: unless-stopped
-    labels:
-      - "group=cloud"
-  memory:
-    build:
-      context: ./memory
-      dockerfile: Dockerfile
-    container_name: memory
-    # Port exposed only via toxiproxy (host 8005 -> toxiproxy 18005 -> memory 8002)
-    depends_on:
-      - qdrant
-      - neo4j
-    environment:
-      - MEMORY_BACKEND=${MEMORY_BACKEND}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
-      - NEO4J_URI=bolt://neo4j:7687
-      - NEO4J_USER=neo4j
-      - NEO4J_PASSWORD=password
-      - GRAPHITI_TELEMETRY_ENABLED=false
-      - QDRANT_HOST=qdrant
-      - QDRANT_PORT=6333
-    networks:
-      - memory-internal
-      - dmas-network
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 256M
-    restart: unless-stopped
-    labels:
-      - "group=cloud"
-  responder:
-    build:
-      context: ./responder
-      dockerfile: Dockerfile
-    container_name: responder
-    # Port exposed only via toxiproxy (host 8006 -> toxiproxy 18006 -> responder 8003)
-    environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - MODEL=${MODEL:-gpt-4o}
-      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
-    networks:
-      - dmas-network
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 256M
-    restart: unless-stopped
-    labels:
-      - "group=cloud"
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    ports:
-      - "127.0.0.1:11435:11434" # Changed to 11435 to avoid conflict with host ollama
-    volumes:
-      - ollama_data:/root/.ollama
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        ollama serve &
-        OLLAMA_PID=$$!
-
-        echo "Waiting for Ollama server to start..."
-        sleep 10
-        until ollama list > /dev/null 2>&1; do
-          echo "Still waiting for Ollama..."
-          sleep 2
-        done
-
-        echo "Ollama server is ready, pulling model..."
-        ollama pull ${OLLAMA_MODEL}
-
-        echo "Model pulled successfully"
-        wait $$OLLAMA_PID
-    networks:
-      - dmas-network
-    environment:
-      - OLLAMA_MODEL=${OLLAMA_MODEL}
-    healthcheck:
-      test: ["CMD-SHELL", "ollama list | grep -q '${OLLAMA_MODEL}'"]
-      interval: 5s
-      timeout: 5s
-      retries: 120
-      start_period: 180s
-    deploy:
-      resources:
-        limits:
-          memory: 12G
-        reservations:
-          memory: 6G
-    restart: unless-stopped
-    labels:
-      - "group=edge"
-  coordinator:
-    build:
-      context: ./coordinator
-      dockerfile: Dockerfile
-    container_name: coordinator
-    ports:
-      - "127.0.0.1:8003:8001"
-    depends_on:
-      locomo:
-        condition: service_started
-      memory:
-        condition: service_started
-      responder:
-        condition: service_started
-      ollama:
-        condition: service_healthy
-      toxiproxy:
-        condition: service_started
-    environment:
-      - LOCOMO_URL=http://toxiproxy:18007
-      - MEMORY_URL=http://toxiproxy:18005
-      - RESPONDER_URL=http://toxiproxy:18006
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
-      - OLLAMA_MODEL=${OLLAMA_MODEL}
-    networks:
-      - dmas-network
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-        reservations:
-          memory: 512M
-    restart: unless-stopped
-    labels:
-      - "group=edge"
-volumes:
-  qdrant-data:
-    labels:
-      group: cloud
-  neo4j-data:
-    labels:
-      group: cloud
-  neo4j-logs:
-    labels:
-      group: cloud
-  ollama_data:
+    networks: [agent1-net, shared-net]
+    volumes: [qdrant-data-1:/qdrant/storage]
     labels:
       group: edge
+
+  qdrant-2:
+    image: qdrant/qdrant:v1.12.4
+    container_name: dmas-qdrant-2
+    restart: unless-stopped
+    networks: [agent2-net, shared-net]
+    volumes: [qdrant-data-2:/qdrant/storage]
+    labels:
+      group: cloud
+
+  qdrant-3:
+    image: qdrant/qdrant:v1.12.4
+    container_name: dmas-qdrant-3
+    restart: unless-stopped
+    networks: [agent3-net, shared-net]
+    volumes: [qdrant-data-3:/qdrant/storage]
+    labels:
+      group: cloud
+
+  neo4j-1:
+    image: neo4j:5.26
+    container_name: dmas-neo4j-1
+    restart: unless-stopped
+    networks: [agent1-net, shared-net]
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-password}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - neo4j-data-1:/data
+      - neo4j-logs-1:/logs
+    labels:
+      group: edge
+
+  neo4j-2:
+    image: neo4j:5.26
+    container_name: dmas-neo4j-2
+    restart: unless-stopped
+    networks: [agent2-net, shared-net]
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-password}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - neo4j-data-2:/data
+      - neo4j-logs-2:/logs
+    labels:
+      group: cloud
+
+  neo4j-3:
+    image: neo4j:5.26
+    container_name: dmas-neo4j-3
+    restart: unless-stopped
+    networks: [agent3-net, shared-net]
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-password}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - neo4j-data-3:/data
+      - neo4j-logs-3:/logs
+    labels:
+      group: cloud
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: dmas-ollama
+    restart: unless-stopped
+    networks: [shared-net]
+    volumes: [ollama-data:/root/.ollama]
+    environment:
+      OLLAMA_KEEP_ALIVE: 30m
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_NUM_THREADS: "16"
+    deploy:
+      resources:
+        reservations:
+          memory: 6G
+        limits:
+          memory: 12G
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    labels:
+      group: edge
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: dmas-ollama-pull
+    networks: [shared-net]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: ["/bin/sh","-c"]
+    command: ["echo '==> ollama pull gemma4:e4b' && ollama pull gemma4:e4b"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    restart: "no"
+
+  # ---------------- langfuse self-hosted ----------------
+  langfuse-postgres:
+    image: postgres:16-alpine
+    container_name: dmas-langfuse-postgres
+    restart: unless-stopped
+    networks: [shared-net]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: langfuse
+    volumes: [langfuse-postgres:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d langfuse"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    labels:
+      group: observability
+
+  langfuse-clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: dmas-langfuse-clickhouse
+    restart: unless-stopped
+    networks: [shared-net]
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    command: ["--max_server_memory_usage_to_ram_ratio=0.3"]
+    volumes: [langfuse-clickhouse:/var/lib/clickhouse]
+    labels:
+      group: observability
+
+  langfuse-web:
+    image: langfuse/langfuse:2
+    container_name: dmas-langfuse-web
+    restart: unless-stopped
+    networks: [shared-net]
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@langfuse-postgres:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3001
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-changeme-please}
+      SALT: ${LANGFUSE_SALT:-changeme-please}
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_INIT_ORG_ID: dmas
+      LANGFUSE_INIT_PROJECT_ID: dmas
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+    ports:
+      - "127.0.0.1:3001:3000"
+    labels:
+      group: observability
+
+  # ---------------- per-agent stacks ----------------
+
+  toxiproxy-1:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: dmas-toxiproxy-1
+    restart: unless-stopped
+    networks: [agent1-net, shared-net]
+    command: ["-host", "0.0.0.0", "-config", "/config.json", "-proxy-metrics", "-runtime-metrics"]
+    volumes: [./toxiproxy/agent-1.json:/config.json:ro]
+    ports:
+      - "127.0.0.1:8475:8474"
+    labels:
+      group: edge
+
+  litellm-1:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: dmas-litellm-1
+    restart: unless-stopped
+    networks: [agent1-net, shared-net]
+    depends_on:
+      ollama:
+        condition: service_healthy
+      ollama-pull:
+        condition: service_completed_successfully
+      langfuse-web:
+        condition: service_started
+    volumes: [./litellm/agent-1.yaml:/app/config.yaml:ro]
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: http://langfuse-web:3000
+      LANGFUSE_DEFAULT_TAGS: '["agent-1","litellm"]'
+    labels:
+      group: edge
+
+  agent-1:
+    <<: *agent-base
+    build:
+      context: ./agent
+    container_name: dmas-agent-1
+    networks: [agent1-net, shared-net]
+    depends_on:
+      qdrant-1:
+        condition: service_started
+      neo4j-1:
+        condition: service_healthy
+      litellm-1:
+        condition: service_started
+    environment:
+      AGENT_ID: "1"
+      LITELLM_URL: http://litellm-1:4000/v1
+      PEERS: http://toxiproxy-1:18002,http://toxiproxy-1:18003
+      TOXIPROXY_ADMIN: http://toxiproxy-1:8474
+      JITTER_PROXY_NAME: peers
+      QDRANT_URL: http://qdrant-1:6333
+      NEO4J_URI: bolt://neo4j-1:7687
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-password}
+      LANGFUSE_HOST: http://langfuse-web:3000
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      MAX_CONTEXT_MEMORIES: ${MAX_CONTEXT_MEMORIES:-40}
+      SEARCH_LIMIT: ${SEARCH_LIMIT:-200}
+      MEM0_COLLECTION: mem0_agent1
+      RAG_COLLECTION: rag_agent1
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ports:
+      - "127.0.0.1:8011:8000"
+    labels:
+      group: edge
+
+  coordinator:
+    build: ./coordinator
+    image: dmas/coordinator:latest
+    container_name: dmas-coordinator
+    restart: unless-stopped
+    networks: [shared-net]
+    depends_on:
+      agent-1:
+        condition: service_started
+      agent-2:
+        condition: service_started
+      agent-3:
+        condition: service_started
+      toxiproxy-1:
+        condition: service_started
+      toxiproxy-2:
+        condition: service_started
+      toxiproxy-3:
+        condition: service_started
+    environment:
+      AGENT_UPSTREAM: http://agent-1:8000
+      UPSTREAM_AGENT_ID: "1"
+      AGENT_URLS: http://agent-1:8000,http://agent-2:8000,http://agent-3:8000
+      TOXIPROXY_ADMINS: http://toxiproxy-1:8474,http://toxiproxy-2:8474,http://toxiproxy-3:8474
+      PROMETHEUS_URL: http://prometheus:9090
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      JUDGE_MODEL_ZEP: ${JUDGE_MODEL_ZEP:-gpt-5-mini}
+    volumes:
+      - coordinator-data:/data
+    ports:
+      - "8810:8000"
+    labels:
+      group: edge
+
+  # NOTE: peer-heartbeat is now run BY each agent (dmas/agent/app/heartbeat.py)
+  # so the peer_request_duration_seconds histogram (driving the Grafana
+  # dashboard) gets populated alongside toxiproxy bytes — no separate sidecar.
+
+  toxiproxy-2:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: dmas-toxiproxy-2
+    restart: unless-stopped
+    networks: [agent2-net, shared-net]
+    command: ["-host", "0.0.0.0", "-config", "/config.json", "-proxy-metrics", "-runtime-metrics"]
+    volumes: [./toxiproxy/agent-2.json:/config.json:ro]
+    ports:
+      - "127.0.0.1:8476:8474"
+    labels:
+      group: cloud
+
+  litellm-2:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: dmas-litellm-2
+    restart: unless-stopped
+    networks: [agent2-net, shared-net]
+    depends_on:
+      ollama:
+        condition: service_healthy
+      ollama-pull:
+        condition: service_completed_successfully
+      langfuse-web:
+        condition: service_started
+    volumes: [./litellm/agent-2.yaml:/app/config.yaml:ro]
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: http://langfuse-web:3000
+      LANGFUSE_DEFAULT_TAGS: '["agent-2","litellm"]'
+    labels:
+      group: cloud
+
+  agent-2:
+    <<: *agent-base
+    container_name: dmas-agent-2
+    networks: [agent2-net, shared-net]
+    depends_on:
+      qdrant-2:
+        condition: service_started
+      neo4j-2:
+        condition: service_healthy
+      litellm-2:
+        condition: service_started
+    environment:
+      AGENT_ID: "2"
+      LITELLM_URL: http://litellm-2:4000/v1
+      PEERS: http://toxiproxy-2:18001,http://toxiproxy-2:18003
+      TOXIPROXY_ADMIN: http://toxiproxy-2:8474
+      JITTER_PROXY_NAME: peers
+      QDRANT_URL: http://qdrant-2:6333
+      NEO4J_URI: bolt://neo4j-2:7687
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-password}
+      LANGFUSE_HOST: http://langfuse-web:3000
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      MAX_CONTEXT_MEMORIES: ${MAX_CONTEXT_MEMORIES:-40}
+      SEARCH_LIMIT: ${SEARCH_LIMIT:-200}
+      MEM0_COLLECTION: mem0_agent2
+      RAG_COLLECTION: rag_agent2
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ports:
+      - "127.0.0.1:8012:8000"
+    labels:
+      group: cloud
+
+  toxiproxy-3:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: dmas-toxiproxy-3
+    restart: unless-stopped
+    networks: [agent3-net, shared-net]
+    command: ["-host", "0.0.0.0", "-config", "/config.json", "-proxy-metrics", "-runtime-metrics"]
+    volumes: [./toxiproxy/agent-3.json:/config.json:ro]
+    ports:
+      - "127.0.0.1:8477:8474"
+    labels:
+      group: cloud
+
+  litellm-3:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: dmas-litellm-3
+    restart: unless-stopped
+    networks: [agent3-net, shared-net]
+    depends_on:
+      ollama:
+        condition: service_healthy
+      ollama-pull:
+        condition: service_completed_successfully
+      langfuse-web:
+        condition: service_started
+    volumes: [./litellm/agent-3.yaml:/app/config.yaml:ro]
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: http://langfuse-web:3000
+      LANGFUSE_DEFAULT_TAGS: '["agent-3","litellm"]'
+    labels:
+      group: cloud
+
+  agent-3:
+    <<: *agent-base
+    container_name: dmas-agent-3
+    networks: [agent3-net, shared-net]
+    depends_on:
+      qdrant-3:
+        condition: service_started
+      neo4j-3:
+        condition: service_healthy
+      litellm-3:
+        condition: service_started
+    environment:
+      AGENT_ID: "3"
+      LITELLM_URL: http://litellm-3:4000/v1
+      PEERS: http://toxiproxy-3:18001,http://toxiproxy-3:18002
+      TOXIPROXY_ADMIN: http://toxiproxy-3:8474
+      JITTER_PROXY_NAME: peers
+      QDRANT_URL: http://qdrant-3:6333
+      NEO4J_URI: bolt://neo4j-3:7687
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-password}
+      LANGFUSE_HOST: http://langfuse-web:3000
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      MAX_CONTEXT_MEMORIES: ${MAX_CONTEXT_MEMORIES:-40}
+      SEARCH_LIMIT: ${SEARCH_LIMIT:-200}
+      MEM0_COLLECTION: mem0_agent3
+      RAG_COLLECTION: rag_agent3
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ports:
+      - "127.0.0.1:8013:8000"
+    labels:
+      group: cloud
+
 networks:
-  dmas-network:
-    external: true
-  memory-internal:
+  shared-net:
     driver: bridge
+  agent1-net:
+    driver: bridge
+  agent2-net:
+    driver: bridge
+  agent3-net:
+    driver: bridge
+
+volumes:
+  qdrant-data-1:
+  qdrant-data-2:
+  qdrant-data-3:
+  neo4j-data-1:
+  neo4j-data-2:
+  neo4j-data-3:
+  neo4j-logs-1:
+  neo4j-logs-2:
+  neo4j-logs-3:
+  ollama-data:
+  coordinator-data:
+  langfuse-postgres:
+  langfuse-clickhouse:

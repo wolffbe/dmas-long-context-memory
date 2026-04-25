@@ -1,0 +1,86 @@
+{
+  "title": "Inter-agent peer latency",
+  "uid": "dmas-inter-agent",
+  "schemaVersion": 39,
+  "version": 4,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "timezone": "browser",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "agent-1 ↔ agent-2",
+      "id": 1,
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(peer_request_duration_seconds_bucket{src=~\"1|2\", dst=~\"1|2\"}[1m])))",
+          "legendFormat": "latency"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(peer_request_duration_seconds_bucket{src=~\"1|2\", dst=~\"1|2\"}[1m]))) + max(peer_toxic_jitter_ms{src=~\"1|2\"})/1000",
+          "legendFormat": "latency + jitter"
+        },
+        {
+          "refId": "C",
+          "expr": "max(peer_latency_threshold_ms{src=~\"1|2\"}) / 1000",
+          "legendFormat": "peer-skip threshold"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "agent-2 ↔ agent-3",
+      "id": 2,
+      "gridPos": { "x": 0, "y": 8, "w": 24, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(peer_request_duration_seconds_bucket{src=~\"2|3\", dst=~\"2|3\"}[1m])))",
+          "legendFormat": "latency"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(peer_request_duration_seconds_bucket{src=~\"2|3\", dst=~\"2|3\"}[1m]))) + max(peer_toxic_jitter_ms{src=~\"2|3\"})/1000",
+          "legendFormat": "latency + jitter"
+        },
+        {
+          "refId": "C",
+          "expr": "max(peer_latency_threshold_ms{src=~\"2|3\"}) / 1000",
+          "legendFormat": "peer-skip threshold"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "agent-1 ↔ agent-3",
+      "id": 3,
+      "gridPos": { "x": 0, "y": 16, "w": 24, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(peer_request_duration_seconds_bucket{src=~\"1|3\", dst=~\"1|3\"}[1m])))",
+          "legendFormat": "latency"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(peer_request_duration_seconds_bucket{src=~\"1|3\", dst=~\"1|3\"}[1m]))) + max(peer_toxic_jitter_ms{src=~\"1|3\"})/1000",
+          "legendFormat": "latency + jitter"
+        },
+        {
+          "refId": "C",
+          "expr": "max(peer_latency_threshold_ms{src=~\"1|3\"}) / 1000",
+          "legendFormat": "peer-skip threshold"
+        }
+      ]
+    }
+  ]
+}

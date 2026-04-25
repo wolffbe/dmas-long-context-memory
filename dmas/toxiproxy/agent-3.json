@@ -1,0 +1,14 @@
+[
+  {
+    "name": "peers",
+    "listen": "0.0.0.0:18001",
+    "upstream": "agent-1:8000",
+    "enabled": true
+  },
+  {
+    "name": "peers-2",
+    "listen": "0.0.0.0:18002",
+    "upstream": "agent-2:8000",
+    "enabled": true
+  }
+]

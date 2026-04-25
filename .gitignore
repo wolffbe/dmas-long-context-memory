@@ -13,7 +13,3 @@ __pycache__/
 *$py.class
 *.so
 .Python
-
-logs
-
-batch_runs

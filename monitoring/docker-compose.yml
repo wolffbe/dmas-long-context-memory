@@ -1,41 +1,54 @@
+name: dmas-monitoring
+
 services:
   docker-proxy:
     image: alpine/socat
-    container_name: docker-proxy
-    command: TCP-LISTEN:2375,fork,reuseaddr UNIX-CONNECT:/var/run/docker.sock
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    ports:
-      - "127.0.0.1:2375:2375"
-    networks:
-      - dmas-network
     restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: ["TCP4-LISTEN:2375,fork,reuseaddr", "UNIX-CONNECT:/var/run/docker.sock"]
+    networks: [shared-net]
+
   telegraf:
-    image: telegraf:latest
-    container_name: telegraf
-    depends_on:
-      - docker-proxy
+    image: telegraf:1.32-alpine
+    restart: unless-stopped
+    depends_on: [docker-proxy]
     volumes:
       - ./telegraf.conf:/etc/telegraf/telegraf.conf:ro
-    ports:
-      - "127.0.0.1:9273:9273"
-    networks:
-      - dmas-network
-    restart: unless-stopped
+    networks: [shared-net]
+
   prometheus:
-    image: prom/prometheus:latest
-    container_name: prometheus
-    ports:
-      - "127.0.0.1:9090:9090"
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
-    networks:
-      - dmas-network
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks: [shared-net]
+
+  grafana:
+    image: grafana/grafana:11.3.0
     restart: unless-stopped
+    depends_on: [prometheus]
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks: [shared-net]
 
 networks:
-  dmas-network:
+  shared-net:
     external: true
+    name: dmas_shared-net
+
 volumes:
   prometheus-data:
+  grafana-data:
