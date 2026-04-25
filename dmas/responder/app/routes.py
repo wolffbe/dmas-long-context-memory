@@ -1,4 +1,8 @@
 import os
+# Import BEFORE the service — patches openai chat/embeddings/responses
+# `create` to inject `metadata.tags` so litellm tags the trace.
+from app import langfuse_tags  # noqa: F401
+
 from fastapi import FastAPI, HTTPException
 
 from app.responder_service import ResponderService
@@ -7,7 +11,8 @@ from app.models import ResponseRequest
 app = FastAPI(title="responder", version="1.0")
 
 responder = ResponderService(
-    model=os.getenv("MODEL", "gpt-4o-mini")
+    model=os.getenv("MODEL", "gpt-4o-mini"),
+    memory_url=os.getenv("MEMORY_URL", "http://toxiproxy:18005"),
 )
 
 @app.get("/health")
@@ -23,7 +28,7 @@ async def health():
 @app.post("/respond")
 async def respond(request: ResponseRequest):
     try:
-        result = responder.respond(request.question, request.memory)
+        result = responder.respond(request.question, request.backend)
         
         if result.get("status") == "error":
             raise HTTPException(status_code=500, detail=result.get("error"))

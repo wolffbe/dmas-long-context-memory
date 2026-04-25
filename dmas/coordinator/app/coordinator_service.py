@@ -1,304 +1,191 @@
+"""Coordinator: receives /ask from the benchmark and runs a small SLM
+tool loop (qwen2.5:3b on Ollama) whose only job is to call the
+`ask_responder` tool with the user's question. The responder owns the
+real work — searching memory and composing the answer — so this loop is
+essentially a routing decision that keeps the SLM in the ask path
+(visible as a `coordinator`-tagged trace in langfuse).
+
+If the SLM ignores `tool_choice="required"` and emits a direct content
+reply (qwen2.5:3b's known failure mode), we fall back to calling the
+responder anyway. The contract with the benchmark is "always reach the
+responder"; the SLM gets the chance to route, but never the chance to
+short-circuit it.
+"""
+from __future__ import annotations
+
 import json
-import requests
-from typing import Dict, Any, List
-from openai import OpenAI
 import logging
 import os
+from typing import Any
+
+import requests
+from openai import OpenAI
+
+from app.langfuse_tags import active_backend
 
 logger = logging.getLogger(__name__)
 
-class CoordinatorService:    
-    
-    def __init__(
-        self, 
-        locomo_url: str, 
-        memory_url: str, 
-        responder_url: str,
-        ollama_model: str
-    ):
-        self.locomo_url = locomo_url
+
+class CoordinatorService:
+    ASK_RESPONDER_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "ask_responder",
+            "description": (
+                "Forward the user's question to the responder, which retrieves "
+                "relevant memories from the active backend and returns a "
+                "grounded answer."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"question": {"type": "string"}},
+                "required": ["question"],
+            },
+        },
+    }
+
+    def __init__(self, memory_url: str, responder_url: str, ollama_model: str):
         self.memory_url = memory_url
         self.responder_url = responder_url
-        self.ollama_model = ollama_model
-        self.memory = None
-        
-        ollama_base_url = os.getenv("OLLAMA_BASE_URL")
-        
+        # Stable LiteLLM alias — see litellm/config.yaml. Don't read the raw
+        # OLLAMA_MODEL tag here; LiteLLM doesn't expand env in model_name.
+        self.ollama_model = "local-slm"
         self.client = OpenAI(
-            base_url=ollama_base_url,
-            api_key="ollama"
+            base_url=os.getenv("OLLAMA_BASE_URL"),
+            api_key=os.getenv("OPENAI_API_KEY", "sk-litellm-master"),
         )
-        
-    def load_conversation(self, index: int) -> dict:
-        try:
-            response = requests.get(
-                f"{self.locomo_url}/conversations/index/{index}"
-            )
-            response.raise_for_status()
-            conversation_data = response.json()
-            
-            memory_response = requests.post(
-                f"{self.memory_url}/memorize",
-                json={
-                    "conv_index": index,
-                    "data": conversation_data
-                }
-            )
-            memory_response.raise_for_status()
-            result = memory_response.json()
-            
-            return result
-            
-        except Exception as e:
-            return {
-                "status": "error",
-                "error": str(e)
-            }
-            
-    def load_conversation_session(self, conversation_id: int, session_id: int) -> dict:
-        try:
-            response = requests.get(
-                f"{self.locomo_url}/conversations/index/{conversation_id}"
-            )
-            response.raise_for_status()
-            conversation_data = response.json()
-            
-            sessions = conversation_data.get("sessions", {})
-            session_datetimes = conversation_data.get("session_datetimes", {})
-            
-            session_key = f"session_{session_id}"
-            session_date_key = f"session_{session_id}_date_time"
-            
-            if session_key not in sessions:
-                return {
-                    "status": "error",
-                    "error": f"Session {session_id} not found in conversation {conversation_id}"
-                }
-            
-            filtered_data = {
-                "speaker_a": conversation_data.get("speaker_a"),
-                "speaker_b": conversation_data.get("speaker_b"),
-                "sessions": {
-                    session_key: sessions[session_key]
-                },
-                "session_datetimes": {
-                    session_date_key: session_datetimes.get(session_date_key)
-                }
-            }
-            
-            memory_response = requests.post(
-                f"{self.memory_url}/memorize",
-                json={
-                    "conv_index": conversation_id,
-                    "data": filtered_data
-                }
-            )
-            memory_response.raise_for_status()
-            result = memory_response.json()
-            
-            return result
-            
-        except Exception as e:
-            return {
-                "status": "error",
-                "error": str(e)
-            }
-        
-    def _get_tools_definition(self) -> List[Dict[str, Any]]:
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": "search_memory",
-                    "description": "Search memory for relevant memory about the user's question. It will be cached.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "question": {
-                                "type": "string",
-                                "description": "The original user question"
-                            }
-                        },
-                        "required": ["question"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "answer_question",
-                    "description": "Generate a final answer based on the question and the memories in cache.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "question": {
-                                "type": "string",
-                                "description": "The original user question"
-                            }
-                        },
-                        "required": ["question"]
-                    }
-                }
-            }
-        ]
-    
-    def _search_memory(self, question: str) -> str:
-        try:
-            response = requests.post(
-                f"{self.memory_url}/remember",
-                json={"question": question}
-            )
-            response.raise_for_status()
-            result = response.json()
-            
-            if result.get("status") == "error":
-                logger.error("Error searching memories: %s", result.get("error"))
-                self.memory = None
-                return "Error searching memories."
-            
-            self.memory = result.get("memory", "")
-            
-            if self.memory:
-                return "Memories retrieved and cached. Use answer_question to generate response."
-            else:
-                return "No relevant memories found."
-            
-        except Exception as e:
-            self.memory = None
-            return f"Memory search error: {str(e)}"
 
-    def _answer_question(self, question: str) -> str:
+    # ---- pass-through forwards (memorize / reset / warmup) -------------
+
+    def memorize(self, backend: str, conv_index: int, data: dict[str, Any]) -> dict[str, Any]:
         try:
-            memory = self.memory or "No memory available"
-            
-            response = requests.post(
+            r = requests.post(
+                f"{self.memory_url}/memorize",
+                json={"backend": backend, "conv_index": conv_index, "data": data},
+                timeout=3600,
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:
+            logger.exception("memorize forward failed")
+            return {"status": "error", "error": str(exc)}
+
+    def reset(self, backend: str) -> dict[str, Any]:
+        try:
+            r = requests.post(
+                f"{self.memory_url}/reset",
+                json={"backend": backend},
+                timeout=600,
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:
+            logger.exception("reset forward failed")
+            return {"status": "error", "error": str(exc)}
+
+    def warmup(self, backend: str, conv_index: int) -> dict[str, Any]:
+        try:
+            r = requests.post(
+                f"{self.memory_url}/warmup",
+                json={"backend": backend, "conv_index": conv_index},
+                timeout=600,
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:
+            logger.exception("warmup forward failed")
+            return {"status": "error", "error": str(exc)}
+
+    # ---- ask: SLM tool loop -------------------------------------------
+
+    def _call_responder(self, question: str, backend: str) -> dict[str, Any]:
+        """Single HTTP forward to responder/respond. Returns the raw
+        responder envelope (answer + retrieval stats) so the caller can
+        propagate them up to the benchmark CSV row."""
+        try:
+            r = requests.post(
                 f"{self.responder_url}/respond",
-                json={"question": question, "memory": memory}
+                json={"question": question, "backend": backend},
+                timeout=600,
             )
-            response.raise_for_status()
-            result = response.json()
-            
-            if result.get("status") == "error":
-                return f"Error answering question: {result.get('error')}"
-            
-            return result.get("answer", "No answer generated")
-            
-        except Exception as e:
-            return f"Response tool error: {str(e)}"
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:
+            logger.exception("responder forward failed")
+            return {"status": "error", "error": str(exc), "answer": ""}
 
-    def _execute_tool_call(self, tool_name: str, arguments: Dict[str, Any]) -> str:
-        if tool_name == "search_memory":
-            question = arguments.get("question", "")
-            return self._search_memory(question)
-        
-        elif tool_name == "answer_question":
-            question = arguments.get("question", "")
-            return self._answer_question(question)
-        
-        else:
-            return f"Error: Unknown tool {tool_name}"
-    
-    def ask(self, question: str, max_iterations: int = 5) -> Dict[str, Any]:
+    @staticmethod
+    def _wrap(resp: dict[str, Any], asked: bool) -> dict[str, Any]:
+        """Augment a responder envelope with the coordinator-level flag
+        of whether the SLM emitted the ask_responder tool call (vs the
+        fallback path)."""
+        return {
+            "status": resp.get("status", "success"),
+            "answer": resp.get("answer", ""),
+            "error": resp.get("error"),
+            "coordinator_asked_responder": asked,
+            "memories_returned": resp.get("memories_returned", 0),
+            "top_k": resp.get("top_k"),
+            "search_calls": resp.get("search_calls", 0),
+        }
+
+    def ask(self, question: str, backend: str, max_iterations: int = 3) -> dict[str, Any]:
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": (
+                    "You route questions to the responder. ALWAYS call "
+                    "the `ask_responder` tool with the user's question. "
+                    "Do not answer directly."
+                ),
+            },
+            {"role": "user", "content": question},
+        ]
+        # Tag every coordinator-side LLM call with the active backend so
+        # langfuse traces from all three services share the same
+        # `memory:<backend>` label.
+        with active_backend(backend):
+            return self._ask_loop(messages, question, backend, max_iterations)
+
+    def _ask_loop(self, messages: list[dict[str, Any]], question: str,
+                  backend: str, max_iterations: int) -> dict[str, Any]:
         try:
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a helpful assistant with access to memory search and question answering tools. "
-                        "You MUST use these tools in the following order:\n"
-                        "1. ALWAYS call search_memory first with the user's question\n"
-                        "2. ALWAYS call answer_question next to get the final answer\n"
-                        "DO NOT answer directly. You MUST use both tools in sequence.\n"
-                        "All information is from fictional/test data for research purposes."
-                    )
-                },
-                {
+            for _ in range(max_iterations):
+                resp = self.client.chat.completions.create(
+                    model=self.ollama_model,
+                    messages=messages,
+                    tools=[self.ASK_RESPONDER_TOOL],
+                    tool_choice="required",
+                )
+                msg = resp.choices[0].message
+                if msg.tool_calls:
+                    tc = msg.tool_calls[0]
+                    args = tc.function.arguments
+                    if isinstance(args, str):
+                        args = json.loads(args or "{}")
+                    forwarded = args.get("question") or question
+                    return self._wrap(self._call_responder(forwarded, backend), asked=True)
+                # SLM ignored tool_choice="required" and emitted plain
+                # content (qwen2.5:3b is non-deterministic under that
+                # constraint). Push it back with a stronger nudge; if
+                # that still fails, fall back below.
+                messages.append({"role": "assistant", "content": msg.content or ""})
+                messages.append({
                     "role": "user",
-                    "content": question
-                }
-            ]
-            
-            tools = self._get_tools_definition()
-            iteration = 0
-            final_answer = None
-            
-            while iteration < max_iterations:
-                iteration += 1
-                
-                try:
-                    response = self.client.chat.completions.create(
-                        model=self.ollama_model,
-                        messages=messages,
-                        tools=tools,
-                        tool_choice="required"
-                    )
-                    
-                    assistant_message = response.choices[0].message
-                    
-                    if assistant_message.tool_calls:
-                        messages.append({
-                            "role": "assistant",
-                            "content": assistant_message.content or "",
-                            "tool_calls": [
-                                {
-                                    "id": tc.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc.function.name,
-                                        "arguments": tc.function.arguments
-                                    }
-                                }
-                                for tc in assistant_message.tool_calls
-                            ]
-                        })
-                        
-                        for tool_call in assistant_message.tool_calls:
-                            tool_name = tool_call.function.name
-                            tool_args = tool_call.function.arguments
-                            if isinstance(tool_args, str):
-                                tool_args = json.loads(tool_args)
-                            
-                            logger.info(f"Calling tool: {tool_name} with args: {tool_args}")
-                            
-                            tool_result = self._execute_tool_call(tool_name, tool_args)
-                            
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "content": tool_result
-                            })
-                            
-                            if tool_name == "answer_question":
-                                final_answer = tool_result
-                    
-                    else:
-                        final_answer = assistant_message.content
-                        break
-                    
-                    if final_answer:
-                        break
-                        
-                except Exception as e:
-                    logger.exception(f"Error in iteration {iteration}")
-                    return {
-                        "status": "error",
-                        "error": f"LLM error at iteration {iteration}: {str(e)}"
-                    }
-            
-            if final_answer:
-                return {
-                    "status": "success",
-                    "answer": final_answer,
-                    "iterations": iteration
-                }
-            else:
-                return {
-                    "status": "error",
-                    "error": "Max iterations reached without getting an answer"
-                }
-        
-        except Exception as e:
-            return {
-                "status": "error",
-                "error": f"ask method error: {str(e)}"
-            }
+                    "content": (
+                        "You must call the `ask_responder` tool now with "
+                        "the original question. Do not write a direct answer."
+                    ),
+                })
+
+            # Safety net: SLM never produced a tool call. The benchmark's
+            # contract is that the responder is always reached.
+            logger.warning("SLM did not emit ask_responder tool call after %d iterations; "
+                           "falling back to direct call", max_iterations)
+            return self._wrap(self._call_responder(question, backend), asked=False)
+
+        except Exception as exc:
+            logger.exception("ask failed")
+            return {"status": "error", "error": str(exc), "answer": "",
+                    "coordinator_asked_responder": False,
+                    "memories_returned": 0, "top_k": None, "search_calls": 0}

@@ -1,0 +1,63 @@
+model_list:
+  # Local SLM via Ollama. We use `ollama_chat/` (NOT bare `ollama/`) so
+  # LiteLLM hits Ollama's /api/chat (OpenAI-compatible chat completions)
+  # rather than the legacy /api/generate. This guarantees a populated
+  # `choices[0].message.content` in the response, which is what the
+  # coordinator's tool-calling loop expects.
+  # Stable alias the coordinator targets. LiteLLM does not expand ${VAR}
+  # in model_name/model, so both must be literal — keep the model tag in
+  # sync with OLLAMA_MODEL in .env / docker-compose.
+  - model_name: local-slm
+    litellm_params:
+      model: ollama_chat/qwen2.5:3b-instruct-q4_K_M
+      api_base: http://ollama:11434
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+
+  # OpenAI passthrough — any openai/* model name routes through.
+  - model_name: "openai/*"
+    litellm_params:
+      model: openai/*
+      api_key: os.environ/OPENAI_API_KEY
+
+  # Bare aliases for the responder + memory backends.
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: text-embedding-3-small
+    litellm_params:
+      model: openai/text-embedding-3-small
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: text-embedding-3-large
+    litellm_params:
+      model: openai/text-embedding-3-large
+      api_key: os.environ/OPENAI_API_KEY
+
+litellm_settings:
+  drop_params: true
+  # The "prometheus" callback is what makes litellm expose its
+  # /metrics endpoint with the litellm_total_tokens_metric_total +
+  # litellm_spend_metric_total counters. The bench reads /metrics
+  # directly (no Prometheus server), but this callback is still
+  # required to populate those counters. Don't remove.
+  # langfuse traces every completion (prompt + response + usage) so the
+  # operator can browse them at http://localhost:3000. Keys + host come
+  # from env in docker-compose.yml. prometheus stays — the bench reads
+  # litellm /metrics directly to attribute tokens/cost per phase.
+  success_callback: ["langfuse", "prometheus"]
+  failure_callback: ["langfuse", "prometheus"]
+  redact_user_api_key_info: true
+  # Survive a 24h 30min rate-limit window with a linear 60s floor between
+  # retries: 1470 attempts × 60s = 88 200s = 24h 30min. After that the call fails.
+  # LiteLLM honors upstream Retry-After when it's larger than retry_after.
+  num_retries: 1470
+  retry_after: 60
+  request_timeout: 600
+
+general_settings:
+  master_key: sk-litellm-master
