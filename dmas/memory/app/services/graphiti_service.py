@@ -157,14 +157,15 @@ class GraphitiService:
                     # Mirror zep_locomo_ingestion.py: data=body, type=message,
                     # created_at=session date, group_id=group_id. graphiti-core's
                     # `reference_time` is the datetime equivalent of Zep cloud's
-                    # `created_at` ISO string. No source_description — the Zep
-                    # graph.add API has no equivalent, and passing one would
-                    # leak extra signal into graphiti-core's entity-extraction
-                    # prompt that Zep's harness never provides.
+                    # `created_at` ISO string. graphiti-core 0.29 made
+                    # `source_description` a required positional arg; we pass an
+                    # empty string to keep the entity-extraction prompt identical
+                    # to Zep's harness, which provides no description.
                     await self.graphiti.add_episode(
                         name=episode_name,
                         episode_body=episode_body,
                         source=EpisodeType.message,
+                        source_description="",
                         reference_time=date_string,
                         group_id=group_id,
                     )

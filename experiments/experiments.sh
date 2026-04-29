@@ -13,7 +13,7 @@ cd "$SCRIPT_DIR/.."
 
 CONV="${CONV:-0}"
 SEEDS="${SEEDS:-1}"
-BACKENDS="${BACKENDS:-mem0 graphiti rag full_context}"
+BACKENDS="${BACKENDS:-mem0 graphiti rag cognee full_context}"
 
 for mode in unconstrained constrained; do
   echo "==> $mode leg (CONV=$CONV BACKENDS='$BACKENDS' SEEDS=$SEEDS)"

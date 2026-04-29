@@ -222,7 +222,13 @@ class Mem0Service:
         connection / loads its collection metadata, paying that cost up
         front instead of folding it into row #1."""
         try:
-            self.memory.search(query="warmup", user_id=f"warmup_{conv_index}", limit=1)
+            # mem0 v2 moved entity scoping into `filters=`; passing
+            # user_id at the top level now raises ValueError.
+            self.memory.search(
+                query="warmup",
+                filters={"user_id": f"warmup_{conv_index}"},
+                limit=1,
+            )
         except Exception:
             logger.exception("mem0 warmup search failed")
         return {"backend": "mem0", "warmed": True}
@@ -268,9 +274,11 @@ class Mem0Service:
 
         logger.info("Mem0 search: query=%r user_id=%r limit=%d", question, self.current_user_id, self.TOP_K)
         try:
+            # mem0 v2 moved entity scoping into `filters=`; passing
+            # user_id at the top level now raises ValueError.
             search_results = self.memory.search(
                 question,
-                user_id=self.current_user_id,
+                filters={"user_id": self.current_user_id},
                 limit=self.TOP_K,
             )
         except Exception:

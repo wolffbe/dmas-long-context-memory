@@ -7,7 +7,7 @@ PY ?= python3
 
 # Knobs for experiment / experiment-test.
 MODE           ?= unconstrained
-BACKENDS       ?= mem0 graphiti rag full_context
+BACKENDS       ?= mem0 graphiti rag cognee full_context
 SEEDS          ?= 3
 MESSAGES       ?= $(LOAD_LIMIT)
 QUESTIONS      ?= $(LIMIT)

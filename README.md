@@ -10,7 +10,8 @@ This project compares two approaches to persistent memory in LLM-based multi-age
 | ----------------- | ---------------------------------------------- | ------- | ------------------------ |
 | **Vector Memory** | [mem0](https://github.com/mem0ai/mem0)         | Qdrant  | Semantic similarity      |
 | **Graph Memory**  | [Graphiti](https://github.com/getzep/graphiti) | Neo4j   | Hybrid edge search       |
-| **Classical RAG** | in-house (`RagService`)                        | Qdrant  | Top-k cosine over chunked turns |
+| **Classical RAG** | in-house (`RagService`)                        | Qdrant  | Top-k cosine over individual turns |
+| **Cognee Memory** | [cognee](https://github.com/topoteretes/cognee) | Neo4j + Qdrant | Knowledge-graph completion (LLM-extracted entities/edges) |
 | **Full Context**  | in-house (`FullContextService`)                | in-process | None — full conversation JSON to responder |
 
 Memory loading and retrieval mirror the upstream evaluation harnesses verbatim — `mem0ai/memory-benchmarks` for mem0, `getzep/zep-papers` for Graphiti — so this testbed reproduces what each project's authors do, then layers a distributed-systems / cost-tracking framework on top.

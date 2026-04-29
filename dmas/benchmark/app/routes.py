@@ -46,7 +46,7 @@ TOXIPROXY_ADMINS: tuple[str, ...] = tuple(
     a.strip() for a in os.getenv("TOXIPROXY_ADMINS", "http://toxiproxy:8474").split(",") if a.strip()
 )
 
-VALID_BACKENDS = ("mem0", "graphiti", "rag", "full_context")
+VALID_BACKENDS = ("mem0", "graphiti", "rag", "cognee", "full_context")
 
 # Constrained-mode network profile. Single source of truth: the operator
 # picks the *mode*, the benchmark picks the toxic values. Override per

@@ -60,11 +60,13 @@ def _turn_text(turn: dict) -> str:
     else:
         photo = ""
     body = f"{text} {photo}".strip() if text else photo
-    return f"{speaker}: {body}".strip(": ").strip() if body else ""
+    if not body:
+        return ""
+    return f"{speaker}: {body}" if speaker else body
 
 
 class RagService:
-    """Classical RAG baseline: chunk → embed → Qdrant → top-k.
+    """Classical RAG baseline: embed each turn → Qdrant → top-k.
 
     Distinct from Mem0Service (which performs LLM-driven memory extraction)
     and GraphitiService (which builds a temporal graph). Same Qdrant
@@ -72,7 +74,6 @@ class RagService:
 
     def __init__(self):
         self.TOP_K = int(os.getenv("MEMORIES_SEARCH_LIMIT", "20"))
-        self.CHUNK_TURNS = int(os.getenv("RAG_CHUNK_TURNS", "5"))
         self.EMBED_MODEL = os.getenv("RAG_EMBED_MODEL", "text-embedding-3-small")
         self.EMBED_DIM = int(os.getenv("RAG_EMBED_DIM", "1536"))
 
@@ -93,11 +94,15 @@ class RagService:
         )
 
     def _embed(self, texts: List[str]) -> List[List[float]]:
-        resp = self.openai.embeddings.create(model=self.EMBED_MODEL, input=texts)
+        resp = self.openai.embeddings.create(
+            model=self.EMBED_MODEL,
+            input=texts,
+            dimensions=self.EMBED_DIM,
+        )
         return [d.embedding for d in resp.data]
 
     def memorize_iter(self, conv_index: int, data: Dict[str, Any]):
-        """Streaming generator: yields one event per chunk, then done."""
+        """Streaming generator: yields one event per turn, then done."""
         speaker_a = data.get("speaker_a", "")
         speaker_b = data.get("speaker_b", "")
         sessions = data.get("sessions") or {}
@@ -129,23 +134,21 @@ class RagService:
             if not texts:
                 continue
 
-            chunks: list[str] = []
-            for i in range(0, len(texts), self.CHUNK_TURNS):
-                chunks.append("\n".join(texts[i : i + self.CHUNK_TURNS]))
-
-            for chunk_idx, chunk in enumerate(chunks):
-                preview = chunk[:120].replace("\n", " ")
+            # `chunk_idx` is the wire-format key shared with mem0/graphiti/
+            # full_context. Semantically it's the turn index within the session.
+            for turn_idx, text in enumerate(texts):
+                preview = text[:120].replace("\n", " ")
                 m_t0 = time.monotonic()
                 u0 = usage_snapshot()
                 try:
-                    vec = self._embed([chunk])[0]
+                    vec = self._embed([text])[0]
                     self.qdrant.upsert(
                         collection_name=collection,
                         points=[qmodels.PointStruct(
                             id=uuid.uuid4().hex,
                             vector=vec,
                             payload={
-                                "text": chunk,
+                                "text": text,
                                 "session": session_key,
                                 "timestamp": session_epoch,
                                 "date": date_str,
@@ -157,12 +160,12 @@ class RagService:
                     u1 = usage_snapshot()
                     du = usage_diff(u0, u1)
                     added += 1
-                    logger.info("[rag load] conv=%d %s chunk=%d wall=%.2fs edge=%d/$%.4f cloud=%d/$%.4f | %s",
-                                conv_index, session_key, chunk_idx, m_wall_ms / 1000,
+                    logger.info("[rag load] conv=%d %s turn=%d wall=%.2fs edge=%d/$%.4f cloud=%d/$%.4f | %s",
+                                conv_index, session_key, turn_idx, m_wall_ms / 1000,
                                 du["edge_tokens"], du["edge_cost"], du["cloud_tokens"], du["cloud_cost"], preview)
                     yield {
                         "event": "memory",
-                        "session": session_key, "chunk_idx": chunk_idx,
+                        "session": session_key, "chunk_idx": turn_idx,
                         "status": "ok", "preview": preview, "error": None,
                         "wall_ms": m_wall_ms,
                         **du,
@@ -171,13 +174,13 @@ class RagService:
                     m_wall_ms = (time.monotonic() - m_t0) * 1000.0
                     u1 = usage_snapshot()
                     du = usage_diff(u0, u1)
-                    logger.exception("RAG ingest failed: conv %d %s chunk %d",
-                                     conv_index, session_key, chunk_idx)
+                    logger.exception("RAG ingest failed: conv %d %s turn %d",
+                                     conv_index, session_key, turn_idx)
                     failed += 1
-                    failures.append({"session": session_key, "chunk_idx": chunk_idx, "error": str(exc)})
+                    failures.append({"session": session_key, "chunk_idx": turn_idx, "error": str(exc)})
                     yield {
                         "event": "memory",
-                        "session": session_key, "chunk_idx": chunk_idx,
+                        "session": session_key, "chunk_idx": turn_idx,
                         "status": "failed", "preview": preview, "error": str(exc)[:300],
                         "wall_ms": m_wall_ms,
                         **du,
@@ -258,5 +261,5 @@ class RagService:
             text = (payload.get("text") or "").strip()
             if text:
                 results.append(text)
-        logger.info("RAG returned %d chunks", len(results))
+        logger.info("RAG returned %d turns", len(results))
         return results

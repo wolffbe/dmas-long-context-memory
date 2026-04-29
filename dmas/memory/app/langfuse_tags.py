@@ -9,7 +9,7 @@ work; the body merge does.
 
 Tag composition:
   - base tag: `LANGFUSE_SERVICE_TAG` env (default `memory`)
-  - sub tag : if `set_active_backend("mem0"|"graphiti"|"rag")` was called
+  - sub tag : if `set_active_backend("mem0"|"graphiti"|"rag"|"cognee")` was called
               for the current async context, also append `<base>:<backend>`
 
 Why a contextvar: a single uvicorn process serves all four backends and
