@@ -14,28 +14,19 @@ model_list:
       input_cost_per_token: 0
       output_cost_per_token: 0
 
-  # OpenAI passthrough — any openai/* model name routes through.
-  - model_name: "openai/*"
-    litellm_params:
-      model: openai/*
-      api_key: os.environ/OPENAI_API_KEY
-
-  # Bare aliases for the responder + memory backends.
-  - model_name: gpt-4o
-    litellm_params:
-      model: openai/gpt-4o
-      api_key: os.environ/OPENAI_API_KEY
+  # The ONLY cloud chat/completion model in the system. Every backend
+  # (responder, judge, mem0/graphiti/cognee extractors, graphiti
+  # cross-encoder reranker) routes through this alias.
   - model_name: gpt-4o-mini
     litellm_params:
       model: openai/gpt-4o-mini
       api_key: os.environ/OPENAI_API_KEY
+
+  # Embeddings (different model class — chat models can't produce
+  # embeddings). Used by mem0/graphiti/cognee/rag for vector retrieval.
   - model_name: text-embedding-3-small
     litellm_params:
       model: openai/text-embedding-3-small
-      api_key: os.environ/OPENAI_API_KEY
-  - model_name: text-embedding-3-large
-    litellm_params:
-      model: openai/text-embedding-3-large
       api_key: os.environ/OPENAI_API_KEY
 
 litellm_settings:

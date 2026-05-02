@@ -131,12 +131,6 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - dmas-network
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-        reservations:
-          memory: 512M
     restart: unless-stopped
     labels:
       - "group=cloud"
@@ -150,12 +144,6 @@ services:
       - qdrant-data:/qdrant/storage
     networks:
       - memory-internal
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-        reservations:
-          memory: 1G
     restart: unless-stopped
     labels:
       - "group=cloud"
@@ -169,8 +157,6 @@ services:
       - NEO4J_AUTH=neo4j/password
       - NEO4J_PLUGINS=["apoc"]
       - NEO4J_dbms_security_procedures_unrestricted=apoc.*
-      - NEO4J_dbms_memory_heap_max__size=512M
-      - NEO4J_dbms_memory_pagecache_size=256M
       # Force a checkpoint after every committed transaction (default
       # 100k) so the async checkpointer flushes the page cache into the
       # bench's per-call snapshot window. The bench then waits for disk
@@ -183,12 +169,6 @@ services:
       - neo4j-logs:/logs
     networks:
       - memory-internal
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-        reservations:
-          memory: 1G
     restart: unless-stopped
     labels:
       - "group=cloud"
@@ -213,17 +193,22 @@ services:
       - MEMORIES_SEARCH_LIMIT=${MEMORIES_SEARCH_LIMIT:-20}
       - RAG_EMBED_MODEL=${RAG_EMBED_MODEL:-text-embedding-3-small}
       - RAG_EMBED_DIM=${RAG_EMBED_DIM:-1536}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
       - LANGFUSE_SERVICE_TAG=memory
+    ulimits:
+      # Cognee 0.5.x stages each `add` to disk and opens a new
+      # SQLAlchemy/aiosqlite session per `cognify`. With our per-message
+      # ingestion contract that's ~12k add+cognify cycles per full sweep,
+      # which can climb past Docker's default 1024 soft FD limit. 65536
+      # gives two orders of magnitude headroom for the memory service —
+      # mem0/graphiti/rag don't need it but share the container.
+      nofile:
+        soft: 65536
+        hard: 65536
     networks:
       - memory-internal
       - dmas-network
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 256M
     restart: unless-stopped
     labels:
       - "group=cloud"
@@ -235,18 +220,12 @@ services:
     # Port exposed only via toxiproxy (host 8006 -> toxiproxy 18006 -> responder 8003)
     environment:
       - OPENAI_API_KEY=${LITELLM_OPENAI_API_KEY:-sk-litellm-master}
-      - MODEL=${MODEL:-gpt-4o-mini}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
       - OPENAI_BASE_URL=${LITELLM_OPENAI_BASE_URL:-http://litellm:4000/v1}
       - MEMORY_URL=${MEMORY_URL:-http://toxiproxy:18005}
       - LANGFUSE_SERVICE_TAG=responder
     networks:
       - dmas-network
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 256M
     restart: unless-stopped
     labels:
       - "group=cloud"
@@ -285,12 +264,6 @@ services:
       timeout: 5s
       retries: 120
       start_period: 180s
-    deploy:
-      resources:
-        limits:
-          memory: 12G
-        reservations:
-          memory: 6G
     restart: unless-stopped
     labels:
       - "group=edge"
@@ -321,12 +294,6 @@ services:
       - LANGFUSE_SERVICE_TAG=coordinator
     networks:
       - dmas-network
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-        reservations:
-          memory: 512M
     restart: unless-stopped
     labels:
       - "group=edge"

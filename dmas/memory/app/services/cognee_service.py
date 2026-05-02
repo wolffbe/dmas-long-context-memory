@@ -81,6 +81,12 @@ class CogneeService:
         cognee.config.set_llm_provider("openai")
         cognee.config.set_llm_model(os.getenv("LLM_MODEL", "gpt-4o-mini"))
         cognee.config.set_llm_api_key(os.getenv("OPENAI_API_KEY", ""))
+        # cognee 0.5.6 defaults llm_temperature to 0, but pin it
+        # explicitly so it can't drift if a future config layer changes
+        # the default. Mirrors the temperature=0 contract used at every
+        # other LLM call site (responder, coordinator, judge, mem0,
+        # graphiti).
+        cognee.config.set_llm_config({"llm_temperature": 0})
         if os.getenv("OPENAI_BASE_URL"):
             cognee.config.set_llm_endpoint(os.environ["OPENAI_BASE_URL"])
         cognee.config.set_embedding_provider("openai")

@@ -1,5 +1,5 @@
 .PHONY: build setup start stop clean reset \
-        experiment experiment-test experiments logs ps \
+        experiment experiment-leg experiment-test experiments logs ps \
         _check_docker _check_openai _check_langfuse_keys _bootstrap_env_file \
         _wait_benchmark _wait_langfuse
 
@@ -8,14 +8,17 @@ PY ?= python3
 # Knobs for experiment / experiment-test.
 MODE           ?= unconstrained
 BACKENDS       ?= mem0 graphiti rag cognee full_context
-SEEDS          ?= 3
+LLM_AS_JUDGE_SEED ?= 3
 MESSAGES       ?= $(LOAD_LIMIT)
 QUESTIONS      ?= $(LIMIT)
 QUESTION_TYPES ?=
 Q_PER_TYPE     ?=
 KEEP_STATE     ?=
 NAME_PREFIX    ?=
-ALL            ?= 0
+
+# LOCOMO conversation indices to sweep in the full `make experiment`.
+# Override per-run, e.g. `make experiment CONVS="0 5"`.
+CONVS          ?= 0 1 2 3 4 5 6 7 8 9
 
 DMAS_COMPOSE  := dmas/docker-compose.yml
 BENCHMARK_URL ?= http://localhost:8002
@@ -182,14 +185,18 @@ _wait_benchmark:
 
 # === workloads ===========================================================
 
-# Single operator entrypoint. For each backend in BACKENDS the benchmark
-# wipes memory, applies toxics for MODE, loads CONV, asks every question for
-# SEEDS independent runs, then wipes again. Streams NDJSON; rows land in
-# experiments/results/results.csv.
-#   make experiment CONV=0 MODE=unconstrained
-#   make experiment CONV=0 MODE=constrained SEEDS=3 BACKENDS="mem0 graphiti"
-#   make experiment CONV=0 MESSAGES=20 QUESTIONS=1   # load 20 msgs, ask 1 q
-experiment:
+# Single-leg primitive used by the sweeps below. For each backend in
+# BACKENDS the benchmark wipes memory, applies toxics for MODE, loads
+# CONV, asks every question ONCE, judges every answer
+# LLM_AS_JUDGE_SEED times and majority-votes, then wipes again.
+# Streams NDJSON; rows land in
+# experiments/results/{prefix}{backend}_{mode}.csv (one file per
+# (framework, mode) — convs share a file, distinguished by the
+# `conversation_index` column and `experiment_name`).
+#   make experiment-leg CONV=0 MODE=unconstrained
+#   make experiment-leg CONV=0 MODE=constrained LLM_AS_JUDGE_SEED=3 BACKENDS="mem0 graphiti"
+#   make experiment-leg CONV=0 MESSAGES=20 QUESTIONS=1   # load 20 msgs, ask 1 q
+experiment-leg:
 	@if [ -z "$(CONV)" ]; then echo "CONV is required — pass CONV=<i>"; exit 2; fi
 	@case "$(MODE)" in unconstrained|constrained) ;; *) \
 		echo "MODE must be unconstrained|constrained — got '$(MODE)'"; exit 2 ;; esac
@@ -210,8 +217,8 @@ experiment:
 	if [ -n "$(KEEP_STATE)" ]; then extras="$$extras,\"skip_post_reset\":true"; fi; \
 	if [ -n "$(NAME_PREFIX)" ]; then extras="$$extras,\"name_prefix\":\"$(NAME_PREFIX)\""; fi; \
 	backends_json=$$(printf '"%s",' $(BACKENDS) | sed 's/,$$//'); \
-	body=$$(printf '{"conv":%s,"mode":"%s","seeds":%s,"backends":[%s]%s}' \
-		"$(CONV)" "$(MODE)" "$(SEEDS)" "$$backends_json" "$$extras"); \
+	body=$$(printf '{"conv":%s,"mode":"%s","llm_as_judge_seed":%s,"backends":[%s]%s}' \
+		"$(CONV)" "$(MODE)" "$(LLM_AS_JUDGE_SEED)" "$$backends_json" "$$extras"); \
 	echo "==> POST $(BENCHMARK_URL)/experiment  body=$$body"; \
 	curl -fsSN -X POST "$(BENCHMARK_URL)/experiment" \
 		-H "Content-Type: application/json" \
@@ -219,33 +226,59 @@ experiment:
 	sleep 0.5
 
 # Calibration-as-test: load 119 messages and ask the first 3 questions
-# per category in 1-4, single seed, unconstrained, keep memory state.
-# 119 is hand-picked: it's the smallest CONV=0 prefix that covers the
-# evidence for the first three questions in each non-adversarial
-# category. The benchmark does not auto-derive that — the operator
-# specifies it. KEEP_STATE means subsequent runs skip the load and only
-# re-ask, so iteration on retrieval / responder / judge is fast.
+# per category in 1-4 across BOTH network regimes (unconstrained +
+# constrained). 119 is hand-picked: it's the smallest CONV=0 prefix
+# that covers the evidence for the first three questions in each
+# non-adversarial category. KEEP_STATE means each leg's post-reset is
+# skipped, so subsequent invocations of the same (backend, mode) re-ask
+# without reloading — iteration on retrieval / responder / judge is fast.
+# Smoke defaults: LLM_AS_JUDGE_SEED=1 (one judge call per answer for
+# speed; the full bench uses 3) and Q_PER_TYPE=3.
 #   make experiment-test CONV=0
 #   make experiment-test CONV=0 BACKENDS="mem0"
-TEST_MESSAGES        ?= 119
-TEST_QUESTION_TYPES  ?= 1,2,3,4
-TEST_Q_PER_TYPE      ?= 3
-TEST_NAME_PREFIX     ?= test_
+TEST_MESSAGES           ?= 119
+TEST_QUESTION_TYPES     ?= 1,2,3,4
+TEST_Q_PER_TYPE         ?= 3
+TEST_NAME_PREFIX        ?= test_
+TEST_LLM_AS_JUDGE_SEED  ?= 1
 experiment-test:
 	@if [ -z "$(CONV)" ]; then echo "CONV is required — pass CONV=<i>"; exit 2; fi
-	@$(MAKE) experiment \
-		CONV=$(CONV) MODE=unconstrained SEEDS=1 \
-		MESSAGES=$(TEST_MESSAGES) \
-		QUESTION_TYPES=$(TEST_QUESTION_TYPES) \
-		Q_PER_TYPE=$(TEST_Q_PER_TYPE) \
-		KEEP_STATE=1 \
-		NAME_PREFIX=$(TEST_NAME_PREFIX) \
-		BACKENDS="$(BACKENDS)"
+	@for mode in unconstrained constrained; do \
+		echo "==> smoke $$mode leg (CONV=$(CONV) BACKENDS='$(BACKENDS)' LLM_AS_JUDGE_SEED=$(TEST_LLM_AS_JUDGE_SEED))"; \
+		$(MAKE) experiment-leg \
+			CONV=$(CONV) MODE=$$mode LLM_AS_JUDGE_SEED=$(TEST_LLM_AS_JUDGE_SEED) \
+			MESSAGES=$(TEST_MESSAGES) \
+			QUESTION_TYPES=$(TEST_QUESTION_TYPES) \
+			Q_PER_TYPE=$(TEST_Q_PER_TYPE) \
+			KEEP_STATE=1 \
+			NAME_PREFIX=$(TEST_NAME_PREFIX) \
+			BACKENDS="$(BACKENDS)" || exit $$?; \
+	done
 
-# Full sweep: both modes for one CONV. Wipes happen automatically per backend
-# inside the benchmark, so unconstrained and constrained never share state.
-experiments:
-	bash experiments/experiments.sh
+# Full publishable sweep: every CONV in CONVS × {unconstrained,
+# constrained} × every backend in BACKENDS. Each (conv, mode) leg wipes
+# memory state at the start, loads the conversation in full, asks every
+# question once, and lets the LLM-as-judge panel run LLM_AS_JUDGE_SEED
+# times per answer (default 3, majority-vote). No KEEP_STATE — every
+# leg starts on clean state. Override CONVS or BACKENDS to narrow:
+#   make experiment
+#   make experiment BACKENDS="mem0 graphiti"
+#   make experiment CONVS="0 5"
+#   make experiment LLM_AS_JUDGE_SEED=5
+experiment:
+	@for conv in $(CONVS); do \
+		for mode in unconstrained constrained; do \
+			echo "==> experiment leg conv=$$conv mode=$$mode (BACKENDS='$(BACKENDS)' LLM_AS_JUDGE_SEED=$(LLM_AS_JUDGE_SEED))"; \
+			$(MAKE) experiment-leg \
+				CONV=$$conv MODE=$$mode \
+				LLM_AS_JUDGE_SEED=$(LLM_AS_JUDGE_SEED) \
+				BACKENDS="$(BACKENDS)" || exit $$?; \
+		done; \
+	done
+
+# Back-compat alias — `make experiments` (plural) used to dispatch the
+# bash sweeper; both now reduce to the in-Makefile sweep above.
+experiments: experiment
 
 logs:
 	docker compose --env-file .env -f $(DMAS_COMPOSE) logs -f

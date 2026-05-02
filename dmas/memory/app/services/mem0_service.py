@@ -56,8 +56,22 @@ def get_sorted_sessions(sessions: Dict[str, Any], session_datetimes: Dict[str, A
     return paired
 
 
-def session_to_chunks(turns: list[dict], speaker_a: str, speaker_b: str) -> list[list[dict]]:
-    """Convert turns to message chunks for ingestion."""
+def session_to_chunks(turns: list[dict], speaker_a: str, speaker_b: str,
+                      session_date: str = "") -> list[list[dict]]:
+    """Convert turns to message chunks for ingestion.
+
+    `session_date` is the LOCOMO `session_*_date_time` string. When
+    parseable we prepend the ISO 8601 UTC timestamp in brackets to every
+    message's `content`, e.g. `"[2023-05-08T13:56:00+00:00] Caroline: ..."`.
+    Mem0 OSS `Memory.add()` has no dedicated `created_at` / `reference_time`
+    kwarg (only the cloud V3 API does), so the message body is the only
+    channel that actually reaches the extractor — anchoring it explicitly
+    here matches what cognee does and gives the LLM a concrete reference
+    time for relative phrases like "yesterday".
+    """
+    parsed = parse_locomo_date(session_date)
+    iso_prefix = parsed.replace(tzinfo=timezone.utc).isoformat() if parsed else None
+
     messages = []
     for turn in turns:
         speaker = turn.get("speaker", "")
@@ -77,7 +91,10 @@ def session_to_chunks(turns: list[dict], speaker_a: str, speaker_b: str) -> list
         if not text:
             continue
         role = "user" if speaker == speaker_a else "assistant"
-        messages.append({"role": role, "content": f"{speaker}: {text}"})
+        body = f"{speaker}: {text}"
+        if iso_prefix:
+            body = f"[{iso_prefix}] {body}"
+        messages.append({"role": role, "content": body})
 
     chunks = []
     for i in range(0, len(messages), CHUNK_SIZE):
@@ -93,6 +110,13 @@ class Mem0Service:
         self.TOP_K = int(os.getenv("MEMORIES_SEARCH_LIMIT", "20"))
 
         config = MemoryConfig(
+            llm={
+                "provider": "openai",
+                "config": {
+                    "model": os.getenv("LLM_MODEL", "gpt-4o-mini"),
+                    "temperature": 0,
+                },
+            },
             vector_store={
                 "provider": "qdrant",
                 "config": {
@@ -123,7 +147,7 @@ class Mem0Service:
         self.current_user_id = user_id
 
         sorted_sessions = get_sorted_sessions(sessions, session_datetimes)
-        total_chunks = sum(len(session_to_chunks(s, speaker_a, speaker_b)) for _, _, s in sorted_sessions)
+        total_chunks = sum(len(session_to_chunks(s, speaker_a, speaker_b, d)) for _, d, s in sorted_sessions)
 
         logger.info(
             "[mem0 load] conv=%d %s & %s sessions=%d chunks=%d",
@@ -135,7 +159,7 @@ class Mem0Service:
         failures: List[Dict[str, Any]] = []
 
         for session_key, date_str, turns in sorted_sessions:
-            chunks = session_to_chunks(turns, speaker_a, speaker_b)
+            chunks = session_to_chunks(turns, speaker_a, speaker_b, date_str)
             if not chunks:
                 continue
 
@@ -254,6 +278,13 @@ class Mem0Service:
             logger.exception("mem0 reset: qdrant collection drop failed")
         # Re-instantiate Memory so it lazily recreates collections on next add.
         config = MemoryConfig(
+            llm={
+                "provider": "openai",
+                "config": {
+                    "model": os.getenv("LLM_MODEL", "gpt-4o-mini"),
+                    "temperature": 0,
+                },
+            },
             vector_store={
                 "provider": "qdrant",
                 "config": {

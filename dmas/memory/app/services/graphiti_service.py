@@ -8,6 +8,9 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from graphiti_core import Graphiti
+from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
+from graphiti_core.llm_client.config import LLMConfig
+from graphiti_core.llm_client.openai_client import OpenAIClient
 from graphiti_core.nodes import EpisodeType
 from graphiti_core.search.search_config_recipes import (
     EDGE_HYBRID_SEARCH_CROSS_ENCODER,
@@ -55,7 +58,25 @@ class GraphitiService:
 
         self.TOP_K = int(os.getenv("MEMORIES_SEARCH_LIMIT", "20"))
 
-        self.graphiti = Graphiti(neo4j_uri, neo4j_user, neo4j_password)
+        # graphiti-core 0.29 defaults LLMConfig.temperature to 1.0 for
+        # extraction; pin it to 0 so entity/relation extraction is
+        # deterministic across benchmark runs. The cross-encoder
+        # reranker is also pointed at gpt-4o-mini so the whole stack
+        # uses a single cloud chat model (the SLM in ollama is the only
+        # other model anywhere in the system).
+        llm_config = LLMConfig(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            base_url=os.getenv("OPENAI_BASE_URL"),
+            model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
+            temperature=0,
+        )
+        llm_client = OpenAIClient(config=llm_config)
+        cross_encoder = OpenAIRerankerClient(config=llm_config)
+        self.graphiti = Graphiti(
+            neo4j_uri, neo4j_user, neo4j_password,
+            llm_client=llm_client,
+            cross_encoder=cross_encoder,
+        )
         self._initialized = False
         self.current_group_id: str | None = None
 

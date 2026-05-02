@@ -5,15 +5,18 @@
     - reset memory state (drop qdrant collections / wipe Neo4j graph)
     - sync toxiproxy to the requested mode (constrained|unconstrained)
     - load the requested LOCOMO conversation through the coordinator
-    - ask every (non-adversarial) question for `seeds` independent runs
+    - ask every (non-adversarial) question once; the LLM-as-judge runs
+      `llm_as_judge_seed` times and majority-votes the verdict
     - reset memory state again so the next backend / next call is clean
 
 Each ask judges the answer with the LLM-as-a-judge grader, measures the
 resource delta directly from /sys/fs/cgroup (zero-cache) and litellm's
-/metrics endpoint, and appends one row per (seed, question) to
-/results/results.csv. Resume is per-row: rows already present for the
-exact (backend, conv, mode, seed, question) are skipped. NDJSON
-progress is streamed back to the caller.
+/metrics endpoint, and appends one row per question to a per-(framework,
+mode) CSV under /results/ named {prefix}{memory}_{mode}.csv. Multiple
+convs share the file and are distinguished by `conversation_index` and
+`experiment_name`. Resume is per-question: rows already present for the
+exact (backend, conv, mode, question) are skipped. NDJSON progress is
+streamed back to the caller.
 """
 from __future__ import annotations
 
@@ -32,9 +35,9 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from app.agents import post_ask, post_memorize, post_reset, post_warmup
-from app.judges import judge
+from app.judges import judge_majority
 from app.locomo_service import LocomoService
-from app.results import RESULTS_CSV, already_done, append_row, loaded_messages
+from app.results import RESULTS_DIR, already_done, append_row, loaded_messages
 from app.litellm_usage import usage_snapshot as litellm_usage_snapshot, diff as litellm_usage_diff
 from app.cgroup_metrics import snapshot as cgroup_snapshot, delta as cgroup_delta, wait_io_quiet as cgroup_wait_io_quiet
 from app.toxics import apply_all, verify_all
@@ -83,13 +86,19 @@ class ExperimentRequest(BaseModel):
       - "constrained":   toxiproxy set to CONSTRAINED_* (defaults: 100/20/512)
 
     For each backend we wipe memory state, apply toxics, load the conv
-    (one /memorize call per message), run the Q&A loop for `seeds` runs,
-    then wipe again. The wipe between backends guarantees clean state.
+    (one /memorize call per message), run the Q&A loop ONCE per question,
+    then wipe again. Each answer is graded by `llm_as_judge_seed`
+    independent judge calls and majority-voted (>50% CORRECT ⇒ CORRECT,
+    default 3 calls so 2/3 = CORRECT).
     """
     conv: int
     mode: str = "unconstrained"
     backends: list[str] = Field(default_factory=lambda: list(VALID_BACKENDS))
-    seeds: int = 1
+    # Number of independent LLM-as-judge calls per (question, answer)
+    # whose verdicts are majority-voted into the final `judge` column.
+    # Was previously called `seeds` and looped the entire ask phase;
+    # now it loops only the judge.
+    llm_as_judge_seed: int = 3
     limit: int | None = None
     load_limit: int | None = None
     name_prefix: str = ""
@@ -160,16 +169,10 @@ def _config_slug(backend: str, conv: int, mode: str) -> str:
     return f"{backend}_conv{conv}_{mode}"
 
 
-def _experiment_name(backend: str, conv: int, mode: str, seed: int, prefix: str) -> str:
-    return f"{prefix}{_config_slug(backend, conv, mode)}_seed{seed}_ask"
-
-
-def _load_experiment_name(backend: str, conv: int, mode: str, prefix: str = "") -> str:
-    return f"{prefix}{_config_slug(backend, conv, mode)}_load"
-
-
-def _warmup_experiment_name(backend: str, conv: int, mode: str, prefix: str = "") -> str:
-    return f"{prefix}{_config_slug(backend, conv, mode)}_warmup"
+def _experiment_name(backend: str, conv: int, mode: str, prefix: str = "") -> str:
+    """Single experiment-name builder — the same string is used for
+    warmup, load, and ask rows; phase lives in the `phase` column."""
+    return f"{prefix}{_config_slug(backend, conv, mode)}"
 
 
 # ---------------------------- routes ------------------------------------
@@ -179,7 +182,7 @@ async def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "loaded_conversations": len(storage.conversations),
-        "results_csv": str(RESULTS_CSV),
+        "results_dir": str(RESULTS_DIR),
         "toxiproxy_admins": list(TOXIPROXY_ADMINS),
         "constrained_profile": {
             "latency_ms": CONSTRAINED_LATENCY,
@@ -223,7 +226,7 @@ async def _do_warmup(
 
     row: dict[str, Any] = {
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "experiment_name": _warmup_experiment_name(backend, conv_idx, mode, name_prefix),
+        "experiment_name": _experiment_name(backend, conv_idx, mode, name_prefix),
         "phase": "warmup",
         "memory": backend,
         "conversation_index": conv_idx,
@@ -308,7 +311,7 @@ async def _do_load(
         # Visible progress for tmux: "[load] mem0 23/419 ..."
         if marker in skip_messages:
             totals["messages_skipped"] += 1
-            log.info("[load] %s %d/%d session=%d SKIP (in results.csv)",
+            log.info("[load] %s %d/%d session=%d SKIP (in per-experiment CSV)",
                      backend, ord_idx, len(msgs), session_int)
             yield {"_phase": "memory_skipped", "backend": backend, "conv": conv_idx,
                    "mode": mode, "i": ord_idx, "total": len(msgs),
@@ -375,7 +378,7 @@ async def _do_load(
 
         row: dict[str, Any] = {
             "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "experiment_name": _load_experiment_name(backend, conv_idx, mode, name_prefix),
+            "experiment_name": _experiment_name(backend, conv_idx, mode, name_prefix),
             "phase": "load",
             "memory": backend,
             "conversation_index": conv_idx,
@@ -472,8 +475,8 @@ async def experiment(req: ExperimentRequest, request: Request):
         questions = questions[: req.limit]
 
     log.info(
-        "/experiment conv=%d mode=%s backends=%s seeds=%d questions=%d toxics=lat%s/jit%s/bw%s",
-        req.conv, req.mode, req.backends, req.seeds, len(questions), latency, jitter, bandwidth,
+        "/experiment conv=%d mode=%s backends=%s judge_n=%d questions=%d toxics=lat%s/jit%s/bw%s",
+        req.conv, req.mode, req.backends, req.llm_as_judge_seed, len(questions), latency, jitter, bandwidth,
     )
 
     async def gen():
@@ -520,7 +523,7 @@ async def experiment(req: ExperimentRequest, request: Request):
                                   "reason": "resuming",
                                   "already_loaded": len(done_msgs)}) + "\n"
 
-            # Load — one message per call, one row per message in results.csv.
+            # Load — one message per call, one row per message in the per-experiment CSV.
             try:
                 async for evt in _do_load(client, backend, req.conv, req.mode,
                                           latency, jitter, bandwidth, done_msgs,
@@ -532,124 +535,144 @@ async def experiment(req: ExperimentRequest, request: Request):
                                   "status": exc.status_code, "detail": str(exc.detail)[:300]}) + "\n"
                 continue
 
-            # Ask.
+            # Ask. Each question is asked ONCE; only the LLM-as-judge
+            # repeats `req.llm_as_judge_seed` times and majority-votes.
             skip = already_done(backend, req.conv, latency, jitter, bandwidth, req.name_prefix)
             conv_obj = storage.get_conversation_by_index(req.conv)
+            exp_name = _experiment_name(backend, req.conv, req.mode, req.name_prefix)
             n_emitted = n_skipped = 0
-            for seed in range(req.seeds):
-                exp_name = _experiment_name(backend, req.conv, req.mode, seed, req.name_prefix)
-                for i, q in enumerate(questions, start=1):
-                    qtext = q["question"]
-                    if (seed, qtext) in skip:
-                        n_skipped += 1
-                        log.info("[exp] %s seed=%d %d/%d SKIP | %s",
-                                 backend, seed, i, len(questions), qtext[:120].replace("\n", " "))
-                        continue
-                    # Re-verify toxics so external drift mid-run aborts cleanly.
-                    await verify_all(client, TOXIPROXY_ADMINS, latency, jitter, bandwidth)
-                    log.info("[exp] %s seed=%d %d/%d ASK | %s",
-                             backend, seed, i, len(questions), qtext[:200].replace("\n", " "))
-                    t_call_start = time.monotonic()
-                    snap_t0 = await cgroup_snapshot(client)
-                    usage_t0 = await litellm_usage_snapshot(client)
+            for i, q in enumerate(questions, start=1):
+                qtext = q["question"]
+                if qtext in skip:
+                    n_skipped += 1
+                    log.info("[exp] %s %d/%d SKIP | %s",
+                             backend, i, len(questions), qtext[:120].replace("\n", " "))
+                    continue
+                # Re-verify toxics so external drift mid-run aborts cleanly.
+                await verify_all(client, TOXIPROXY_ADMINS, latency, jitter, bandwidth)
+                log.info("[exp] %s %d/%d ASK | %s",
+                         backend, i, len(questions), qtext[:200].replace("\n", " "))
+                t_call_start = time.monotonic()
+                snap_t0 = await cgroup_snapshot(client)
+                usage_t0 = await litellm_usage_snapshot(client)
 
-                    answer = ""
-                    err: str | None = None
-                    coordinator_asked_responder: bool | None = None
-                    memories_returned: int | None = None
-                    top_k_seen: int | None = None
-                    search_calls: int | None = None
-                    try:
-                        resp = await post_ask(client, qtext, backend)
-                        # Strip trailing whitespace — the responder/SLM
-                        # sometimes emits a trailing newline that breaks
-                        # CSV viewers even though it's properly quoted.
-                        answer = (resp.get("answer", "") or "").strip()
-                        if resp.get("status") == "error":
-                            err = resp.get("error")
-                        # Retrieval stats threaded up from
-                        # coordinator → responder → memory. Optional;
-                        # legacy responses that don't carry them leave
-                        # the columns blank.
-                        if "coordinator_asked_responder" in resp:
-                            coordinator_asked_responder = bool(resp["coordinator_asked_responder"])
-                        if "memories_returned" in resp:
-                            memories_returned = int(resp["memories_returned"] or 0)
-                        if "top_k" in resp and resp["top_k"] is not None:
-                            top_k_seen = int(resp["top_k"])
-                        if "search_calls" in resp:
-                            search_calls = int(resp["search_calls"] or 0)
-                    except Exception as exc:
-                        err = str(exc)[:300]
+                answer = ""
+                err: str | None = None
+                coordinator_asked_responder: bool | None = None
+                memories_returned: int | None = None
+                top_k_seen: int | None = None
+                search_calls: int | None = None
+                responder_context_tokens: int | None = None
+                try:
+                    resp = await post_ask(client, qtext, backend)
+                    # Strip trailing whitespace — the responder/SLM
+                    # sometimes emits a trailing newline that breaks
+                    # CSV viewers even though it's properly quoted.
+                    answer = (resp.get("answer", "") or "").strip()
+                    if resp.get("status") == "error":
+                        err = resp.get("error")
+                    # Retrieval stats threaded up from
+                    # coordinator → responder → memory. Optional;
+                    # legacy responses that don't carry them leave
+                    # the columns blank.
+                    if "coordinator_asked_responder" in resp:
+                        coordinator_asked_responder = bool(resp["coordinator_asked_responder"])
+                    if "memories_returned" in resp:
+                        memories_returned = int(resp["memories_returned"] or 0)
+                    if "top_k" in resp and resp["top_k"] is not None:
+                        top_k_seen = int(resp["top_k"])
+                    if "search_calls" in resp:
+                        search_calls = int(resp["search_calls"] or 0)
+                    if resp.get("responder_context_tokens") is not None:
+                        responder_context_tokens = int(resp["responder_context_tokens"])
+                except Exception as exc:
+                    err = str(exc)[:300]
 
-                    t_call_end = time.monotonic()
-                    snap_t1 = await cgroup_wait_io_quiet(client)
-                    t_after_flush = time.monotonic()
-                    compute_ms = (t_call_end - t_call_start) * 1000.0
-                    flush_ms = (t_after_flush - t_call_end) * 1000.0
-                    wall_ms = compute_ms + flush_ms
-                    usage_t1 = await litellm_usage_snapshot(client)
-                    mdelta = cgroup_delta(snap_t0, snap_t1)
-                    du = litellm_usage_diff(usage_t0, usage_t1)
-                    edge_llm_tokens = du["edge_tokens"]
-                    edge_llm_cost = du["edge_cost"]
-                    cloud_llm_tokens = du["cloud_tokens"]
-                    cloud_llm_cost = du["cloud_cost"]
-                    llm_tokens = edge_llm_tokens + cloud_llm_tokens
-                    llm_cost = edge_llm_cost + cloud_llm_cost
+                t_call_end = time.monotonic()
+                snap_t1 = await cgroup_wait_io_quiet(client)
+                t_after_flush = time.monotonic()
+                compute_ms = (t_call_end - t_call_start) * 1000.0
+                flush_ms = (t_after_flush - t_call_end) * 1000.0
+                wall_ms = compute_ms + flush_ms
+                usage_t1 = await litellm_usage_snapshot(client)
+                mdelta = cgroup_delta(snap_t0, snap_t1)
+                du = litellm_usage_diff(usage_t0, usage_t1)
+                edge_llm_tokens = du["edge_tokens"]
+                edge_llm_cost = du["edge_cost"]
+                cloud_llm_tokens = du["cloud_tokens"]
+                cloud_llm_cost = du["cloud_cost"]
+                llm_tokens = edge_llm_tokens + cloud_llm_tokens
+                llm_cost = edge_llm_cost + cloud_llm_cost
 
-                    gold = q.get("answer")
-                    if err:
-                        j_label = None
-                        j_reason = None
-                    else:
-                        session_date = _session_date_for_question(conv_obj, q.get("evidence"))
-                        j = await asyncio.to_thread(judge, qtext, gold, answer, session_date)
-                        j_label = j.label
-                        j_reason = (j.reasoning or "").strip()
-
-                    row: dict[str, Any] = {
-                        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
-                        "experiment_name": exp_name,
-                        "phase": "ask",
-                        "memory": backend,
-                        "conversation_index": req.conv,
-                        "name_prefix": req.name_prefix,
-                        "seed": seed,
-                        "question": qtext,
-                        "answer": answer,
-                        "gold_answer": gold,
-                        "category": q.get("category"),
-                        "judge": j_label,
-                        "judge_reason": j_reason,
-                        "toxic_latency": latency,
-                        "toxic_jitter": jitter,
-                        "toxic_bandwidth": bandwidth,
-                        "wall_ms": wall_ms,
-                        "compute_ms": compute_ms,
-                        "flush_ms": flush_ms,
-                        **mdelta,
-                        "edge_llm_tokens": edge_llm_tokens,
-                        "edge_llm_cost_usd": edge_llm_cost,
-                        "cloud_llm_tokens": cloud_llm_tokens,
-                        "cloud_llm_cost_usd": cloud_llm_cost,
-                        "llm_tokens": llm_tokens,
-                        "llm_cost_usd": llm_cost,
-                        "coordinator_asked_responder": coordinator_asked_responder,
-                        "memories_returned": memories_returned,
-                        "top_k": top_k_seen,
-                        "search_calls": search_calls,
-                        "error": err,
-                    }
-                    append_row(row)
-                    n_emitted += 1
-                    log.info(
-                        "[exp] %s seed=%d %d/%d DONE judge=%s wall=%.2fs | gold=%s | answer=%s",
-                        backend, seed, i, len(questions), j_label or "ERROR", wall_ms / 1000,
-                        str(gold)[:160].replace("\n", " "),
-                        answer[:160].replace("\n", " "),
+                gold = q.get("answer")
+                if err:
+                    j_label = None
+                    j_reason = None
+                    j_n = 0
+                    j_correct = 0
+                    j_labels_str: str | None = None
+                else:
+                    session_date = _session_date_for_question(conv_obj, q.get("evidence"))
+                    j = await asyncio.to_thread(
+                        judge_majority, qtext, gold, answer, session_date,
+                        req.llm_as_judge_seed,
                     )
-                    yield json.dumps(row, default=str) + "\n"
+                    j_label = j.label
+                    j_reason = (j.reasonings[0] if j.reasonings else "").strip()
+                    j_n = j.n
+                    j_correct = j.correct_votes
+                    j_labels_str = "|".join(j.votes) if j.votes else None
+
+                row: dict[str, Any] = {
+                    "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "experiment_name": exp_name,
+                    "phase": "ask",
+                    "memory": backend,
+                    "conversation_index": req.conv,
+                    "name_prefix": req.name_prefix,
+                    # `seed` only carries meaning on load rows (session
+                    # number). Ask rows now run once per question, so
+                    # leave the column null here.
+                    "seed": None,
+                    "question": qtext,
+                    "answer": answer,
+                    "gold_answer": gold,
+                    "category": q.get("category"),
+                    "judge": j_label,
+                    "judge_reason": j_reason,
+                    "toxic_latency": latency,
+                    "toxic_jitter": jitter,
+                    "toxic_bandwidth": bandwidth,
+                    "wall_ms": wall_ms,
+                    "compute_ms": compute_ms,
+                    "flush_ms": flush_ms,
+                    **mdelta,
+                    "edge_llm_tokens": edge_llm_tokens,
+                    "edge_llm_cost_usd": edge_llm_cost,
+                    "cloud_llm_tokens": cloud_llm_tokens,
+                    "cloud_llm_cost_usd": cloud_llm_cost,
+                    "llm_tokens": llm_tokens,
+                    "llm_cost_usd": llm_cost,
+                    "coordinator_asked_responder": coordinator_asked_responder,
+                    "memories_returned": memories_returned,
+                    "top_k": top_k_seen,
+                    "search_calls": search_calls,
+                    "responder_context_tokens": responder_context_tokens,
+                    "judge_n": j_n,
+                    "judge_correct_votes": j_correct,
+                    "judge_labels": j_labels_str,
+                    "error": err,
+                }
+                append_row(row)
+                n_emitted += 1
+                log.info(
+                    "[exp] %s %d/%d DONE judge=%s (%d/%d) wall=%.2fs | gold=%s | answer=%s",
+                    backend, i, len(questions), j_label or "ERROR",
+                    j_correct, j_n, wall_ms / 1000,
+                    str(gold)[:160].replace("\n", " "),
+                    answer[:160].replace("\n", " "),
+                )
+                yield json.dumps(row, default=str) + "\n"
 
             # Wipe after so the next backend / next call sees clean state,
             # unless the caller asked to keep it (calibration reuses the

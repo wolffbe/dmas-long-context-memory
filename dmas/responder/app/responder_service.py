@@ -85,6 +85,14 @@ class ResponderService:
         memories_returned = 0
         observed_top_k: int | None = None
         search_calls = 0
+        # `responder_context_tokens` records the prompt_tokens of the
+        # completion that produced the final answer — the actual context
+        # length the answering LLM consumed for this question. Reported
+        # back to the benchmark so efficiency analyses can normalise
+        # accuracy by how much retrieved context the responder had to
+        # process. Updated on every completion; the value at return time
+        # is the one tied to the answer.
+        last_prompt_tokens: int | None = None
         ctx_label = "RAW CONVERSATION JSON" if backend == "full_context" else "CONTEXT"
 
         system_msg = (
@@ -108,6 +116,7 @@ class ResponderService:
                 "memories_returned": memories_returned,
                 "top_k": observed_top_k,
                 "search_calls": search_calls,
+                "responder_context_tokens": last_prompt_tokens,
             }
 
         try:
@@ -117,7 +126,10 @@ class ResponderService:
                     messages=messages,
                     tools=[self.SEARCH_TOOL],
                     tool_choice="auto",
+                    temperature=0,
                 )
+                if resp.usage is not None:
+                    last_prompt_tokens = resp.usage.prompt_tokens
                 msg = resp.choices[0].message
                 if not msg.tool_calls:
                     return _bundle((msg.content or "").strip())
@@ -152,7 +164,10 @@ class ResponderService:
                     "role": "user",
                     "content": "Provide your final answer now using only the context already gathered.",
                 }],
+                temperature=0,
             )
+            if resp.usage is not None:
+                last_prompt_tokens = resp.usage.prompt_tokens
             return _bundle((resp.choices[0].message.content or "").strip())
 
         except Exception as exc:

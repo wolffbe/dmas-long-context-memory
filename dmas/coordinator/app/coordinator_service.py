@@ -127,6 +127,7 @@ class CoordinatorService:
             "memories_returned": resp.get("memories_returned", 0),
             "top_k": resp.get("top_k"),
             "search_calls": resp.get("search_calls", 0),
+            "responder_context_tokens": resp.get("responder_context_tokens"),
         }
 
     def ask(self, question: str, backend: str, max_iterations: int = 3) -> dict[str, Any]:
@@ -156,6 +157,7 @@ class CoordinatorService:
                     messages=messages,
                     tools=[self.ASK_RESPONDER_TOOL],
                     tool_choice="required",
+                    temperature=0,
                 )
                 msg = resp.choices[0].message
                 if msg.tool_calls:
@@ -188,4 +190,5 @@ class CoordinatorService:
             logger.exception("ask failed")
             return {"status": "error", "error": str(exc), "answer": "",
                     "coordinator_asked_responder": False,
-                    "memories_returned": 0, "top_k": None, "search_calls": 0}
+                    "memories_returned": 0, "top_k": None, "search_calls": 0,
+                    "responder_context_tokens": None}

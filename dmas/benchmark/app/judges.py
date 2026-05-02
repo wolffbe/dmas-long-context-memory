@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from openai import OpenAI
 
@@ -13,6 +13,25 @@ from app.prompts import judge as judge_prompts
 class JudgeResult:
     label: str  # "CORRECT" | "WRONG" | "PLACEHOLDER" | "ERROR"
     reasoning: str = ""
+
+
+@dataclass
+class JudgeAggregate:
+    """Result of running the judge `n` independent times against the same
+    (question, gold, response) triple and majority-voting the labels.
+
+    `label` is the consensus verdict (CORRECT iff strictly more than half
+    the judge calls returned CORRECT — default protocol "2/3 true = true").
+    `votes` carries every individual label so analyses can recover
+    inter-judge agreement; `reasonings` carries each non-empty reasoning
+    string. `correct_votes` and `n` give the raw fraction the consensus
+    is built from.
+    """
+    label: str
+    votes: list[str] = field(default_factory=list)
+    reasonings: list[str] = field(default_factory=list)
+    correct_votes: int = 0
+    n: int = 0
 
 
 _client: OpenAI | None = None
@@ -67,3 +86,35 @@ def judge(question: str, gold_answer: str, response: str, session_date: str = ""
         return JudgeResult(label=label, reasoning=reason)
     except Exception as exc:
         return JudgeResult(label="ERROR", reasoning=f"judge_error: {exc}"[:300])
+
+
+def judge_majority(question: str, gold_answer: str, response: str,
+                   session_date: str = "", n: int = 3) -> JudgeAggregate:
+    """Run `judge` n independent times and majority-vote the verdict.
+
+    Consensus protocol: CORRECT iff strictly more than half the calls
+    returned CORRECT (so for n=3 the threshold is 2). PLACEHOLDER and
+    ERROR are surfaced as-is when n=1 to keep parity with single-call
+    semantics; otherwise they count as WRONG for the vote.
+    """
+    if n < 1:
+        n = 1
+    votes: list[str] = []
+    reasonings: list[str] = []
+    for _ in range(n):
+        r = judge(question, gold_answer, response, session_date)
+        votes.append(r.label)
+        if r.reasoning:
+            reasonings.append(r.reasoning)
+
+    # If every vote agrees on a non-CORRECT/WRONG label (PLACEHOLDER/ERROR),
+    # propagate that — don't bury an unimplemented or broken judge under a
+    # WRONG verdict.
+    if votes and all(v == votes[0] and v not in ("CORRECT", "WRONG") for v in votes):
+        return JudgeAggregate(label=votes[0], votes=votes, reasonings=reasonings,
+                              correct_votes=0, n=n)
+
+    correct_votes = sum(1 for v in votes if v == "CORRECT")
+    label = "CORRECT" if correct_votes * 2 > n else "WRONG"
+    return JudgeAggregate(label=label, votes=votes, reasonings=reasonings,
+                          correct_votes=correct_votes, n=n)

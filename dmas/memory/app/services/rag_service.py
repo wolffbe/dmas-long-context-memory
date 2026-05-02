@@ -129,8 +129,19 @@ class RagService:
 
         for session_key, date_str, turns in sorted_sessions:
             session_epoch = _date_epoch(date_str)
+            # Prepend the LOCOMO session timestamp in ISO 8601 UTC so the
+            # stored chunk carries an absolute reference time inline —
+            # same convention cognee/mem0 use, kept symmetric across
+            # backends. RAG has no extractor that consumes it, so this
+            # only affects the embedding vector and what the responder
+            # reads back as context; the `payload.timestamp` field is
+            # still written for any future filter logic that wants it.
+            parsed = _parse_locomo_date(date_str)
+            iso_prefix = parsed.replace(tzinfo=timezone.utc).isoformat() if parsed else None
             texts = [_turn_text(t) for t in turns]
             texts = [t for t in texts if t]
+            if iso_prefix:
+                texts = [f"[{iso_prefix}] {t}" for t in texts]
             if not texts:
                 continue
 

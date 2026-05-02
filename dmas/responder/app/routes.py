@@ -11,7 +11,7 @@ from app.models import ResponseRequest
 app = FastAPI(title="responder", version="1.0")
 
 responder = ResponderService(
-    model=os.getenv("MODEL", "gpt-4o-mini"),
+    model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
     memory_url=os.getenv("MEMORY_URL", "http://toxiproxy:18005"),
 )
 
