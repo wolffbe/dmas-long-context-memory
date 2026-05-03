@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import timezone
 from typing import Any, Dict, List
 
 from graphiti_core import Graphiti
@@ -17,7 +17,8 @@ from graphiti_core.search.search_config_recipes import (
     NODE_HYBRID_SEARCH_RRF,
 )
 
-from app.services.litellm_usage import usage_snapshot, diff as usage_diff
+from shared.litellm_usage import usage_snapshot_sync as usage_snapshot, diff as usage_diff
+from app.services.mem0_service import parse_locomo_date
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +65,19 @@ class GraphitiService:
         # reranker is also pointed at gpt-4o-mini so the whole stack
         # uses a single cloud chat model (the SLM in ollama is the only
         # other model anywhere in the system).
+        #
+        # `small_model` MUST be set explicitly: graphiti's openai client
+        # falls back to `DEFAULT_SMALL_MODEL = 'gpt-4.1-nano'` for any
+        # task it decides is "small" (e.g. dedupe, classification).
+        # LiteLLM only registers `gpt-4o-mini`, so without this pin the
+        # small-model path 400s with `Invalid model name`. Pinning it to
+        # the same `LLM_MODEL` keeps the small/big paths on one alias.
+        cloud_model = os.getenv("LLM_MODEL", "gpt-4o-mini")
         llm_config = LLMConfig(
             api_key=os.getenv("OPENAI_API_KEY"),
             base_url=os.getenv("OPENAI_BASE_URL"),
-            model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
+            model=cloud_model,
+            small_model=cloud_model,
             temperature=0,
         )
         llm_client = OpenAIClient(config=llm_config)
@@ -101,14 +111,6 @@ class GraphitiService:
         except Exception:
             logger.exception("warmup awaitIndexes failed")
         return {"backend": "graphiti", "warmed": True}
-
-    def warmup(self, conv_index: int) -> Dict[str, Any]:
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop.run_until_complete(self.warmup_async(conv_index))
 
     async def memorize_iter_async(self, conv_index: int, data: Dict[str, Any]):
         """Async streaming generator: yields one event per add_episode then
@@ -150,14 +152,15 @@ class GraphitiService:
             if session_date_raw is None:
                 continue
 
-            session_date = session_date_raw + " UTC"
-            date_format = "%I:%M %p on %d %B, %Y UTC"
-            try:
-                date_string = datetime.strptime(session_date, date_format).replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError):
+            # Reuse mem0's parser so graphiti accepts both `%B` (full) and
+            # `%b` (abbreviated) month names — the prior strict `%B`-only
+            # strptime silently dropped sessions with abbreviated names,
+            # leaving them out of the graph while mem0/cognee ingested them.
+            parsed = parse_locomo_date(session_date_raw)
+            if parsed is None:
                 logger.warning("Unparseable session date: %s", session_date_raw)
                 continue
-            iso_date = date_string.isoformat()
+            date_string = parsed.replace(tzinfo=timezone.utc)
 
             for msg_idx, msg in enumerate(session):
                 blip_caption = msg.get("blip_captions")
@@ -167,7 +170,7 @@ class GraphitiService:
                     else ""
                 )
 
-                episode_body = msg.get("speaker") + ": " + msg.get("text") + img_description
+                episode_body = f"{msg.get('speaker', '')}: {msg.get('text', '')}{img_description}"
                 episode_name = f"{group_id}_{session_key}_{added + failed}"
                 idx = added + failed + 1
                 preview = episode_body[:120].replace("\n", " ")
@@ -264,14 +267,6 @@ class GraphitiService:
         summary["memories"] = memories
         return summary
 
-    def memorize_conversation(self, conv_index: int, data: Dict[str, Any]) -> Dict[str, Any]:
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop.run_until_complete(self.memorize_conversation_async(conv_index, data))
-
     async def reset_async(self) -> Dict[str, Any]:
         """Wipe every node + relationship from Neo4j so the next /memorize
         starts on a clean graph. We drop the whole graph rather than
@@ -285,25 +280,15 @@ class GraphitiService:
         # Indexes survive the data wipe; no need to rebuild.
         return {"backend": "graphiti", "deleted": True}
 
-    def reset(self) -> Dict[str, Any]:
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop.run_until_complete(self.reset_async())
-
     async def remember_async(self, question: str) -> List[str]:
         """Mirror Zep's zep_locomo_search.py verbatim:
           - edges: scope='edges', reranker='cross_encoder', limit=TOP_K
           - nodes: scope='nodes', reranker='rrf',           limit=TOP_K
         run in parallel, then merged into Zep's exact FACTS+ENTITIES
-        context template. The single returned element IS that template
-        — `count` is surfaced separately via `_last_search_count`.
+        context template. The single returned element IS that template;
+        the route counts memories via len() on the returned list.
         """
         await self._initialize()
-        # Default to 0 so callers can still read it after a no-op return.
-        self._last_search_count = 0
 
         if not self.current_group_id:
             logger.warning("No active group_id — call memorize first.")
@@ -352,18 +337,10 @@ class GraphitiService:
                 entities='\n'.join(entities_lines),
             )
 
-            self._last_search_count = len(facts_lines) + len(entities_lines)
+            count = len(facts_lines) + len(entities_lines)
             logger.info("Graphiti returned %d facts + %d entity summaries",
                         len(facts_lines), len(entities_lines))
-            return [block] if self._last_search_count else []
+            return [block] if count else []
         except Exception:
             logger.exception("Graphiti search failed")
             return []
-
-    def remember(self, question: str) -> List[str]:
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop.run_until_complete(self.remember_async(question))

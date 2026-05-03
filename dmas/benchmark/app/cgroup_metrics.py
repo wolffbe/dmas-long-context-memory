@@ -155,11 +155,12 @@ def _read_net_tx(pid: str) -> int:
     return tx
 
 
-async def snapshot(_client: httpx.AsyncClient | None = None) -> dict[str, float]:
+async def snapshot(_unused_client: httpx.AsyncClient | None = None) -> dict[str, float]:
     """Per-group sum of cgroup counters at the current instant.
 
     The httpx arg is unused (kept for API parity with the prior helper);
-    docker queries go over the unix socket directly.
+    docker queries go over the unix socket directly. Argument is renamed
+    to avoid shadowing the module-level `_client()` factory.
     """
     if not _label_cache:
         try:

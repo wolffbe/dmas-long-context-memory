@@ -12,7 +12,7 @@ from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
-from app.services.litellm_usage import usage_snapshot, diff as usage_diff
+from shared.litellm_usage import usage_snapshot_sync as usage_snapshot, diff as usage_diff
 
 logger = logging.getLogger(__name__)
 

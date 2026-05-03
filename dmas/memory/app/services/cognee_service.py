@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import timezone
 from typing import Any, Dict, List
 
 # cognee 1.0 turned multi-user access control on by default, which
@@ -26,7 +25,8 @@ from cognee.api.v1.search import SearchType
 # raises "Unsupported vector database provider: qdrant".
 import cognee_community_vector_adapter_qdrant.register  # noqa: F401
 
-from app.services.litellm_usage import usage_snapshot, diff as usage_diff
+from shared.litellm_usage import usage_snapshot_sync as usage_snapshot, diff as usage_diff
+from app.services.mem0_service import parse_locomo_date
 
 logger = logging.getLogger(__name__)
 
@@ -148,14 +148,6 @@ class CogneeService:
             logger.exception("cognee warmup add failed")
         return {"backend": "cognee", "warmed": True, "dataset": dataset}
 
-    def warmup(self, conv_index: int) -> Dict[str, Any]:
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop.run_until_complete(self.warmup_async(conv_index))
-
     async def memorize_iter_async(self, conv_index: int, data: Dict[str, Any]):
         """Async streaming generator: per-message add+cognify, one event
         per message, then a final `{"event":"done"}` summary."""
@@ -194,13 +186,15 @@ class CogneeService:
             if session_date_raw is None:
                 continue
 
-            try:
-                session_dt = datetime.strptime(
-                    session_date_raw + " UTC", "%I:%M %p on %d %B, %Y UTC"
-                ).replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError):
-                logger.warning("Unparseable session date: %s", session_date_raw)
+            # Reuse mem0's parser so cognee handles the same set of date
+            # formats — the previous strict `%B`-only strptime silently
+            # dropped any session with a non-full month name, leaving
+            # those messages out of the graph entirely.
+            parsed = parse_locomo_date(session_date_raw)
+            if parsed is None:
+                logger.warning("Unparseable session date (skipping session): %s", session_date_raw)
                 continue
+            session_dt = parsed.replace(tzinfo=timezone.utc)
 
             for msg_idx, msg in enumerate(session):
                 blip_caption = msg.get("blip_captions")
@@ -216,7 +210,12 @@ class CogneeService:
                 # can pin facts in time the way graphiti's reference_time does.
                 episode = f"[{session_dt.isoformat()}] {body}"
                 idx = added + failed + 1
-                preview = body[:120].replace("\n", " ")
+                # `preview` mirrors what was actually submitted to cognee.add(),
+                # so the CSV `answer` column on load rows surfaces the date
+                # prefix. Without this, an analyst can't tell from the CSV
+                # alone whether the temporal anchor reached cognee — they'd
+                # have to grep container logs.
+                preview = episode[:120].replace("\n", " ")
 
                 m_t0 = time.monotonic()
                 u0 = usage_snapshot()
@@ -285,30 +284,6 @@ class CogneeService:
         summary["memories"] = memories
         return summary
 
-    def memorize_conversation(self, conv_index: int, data: Dict[str, Any]) -> Dict[str, Any]:
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop.run_until_complete(self.memorize_conversation_async(conv_index, data))
-
-    # `memorize_iter` (sync) is needed by the streaming /memorize_stream
-    # path. Drains the async iterator into a list and replays it; cognee
-    # only exposes async APIs, so we can't yield each event the moment
-    # the await resolves without an async route. The bench currently
-    # uses the non-streaming /memorize endpoint via memorize_conversation.
-    def memorize_iter(self, conv_index: int, data: Dict[str, Any]):
-        async def _drain():
-            return [e async for e in self.memorize_iter_async(conv_index, data)]
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        for evt in loop.run_until_complete(_drain()):
-            yield evt
-
     async def reset_async(self) -> Dict[str, Any]:
         """Drop everything cognee has persisted: graph data, vectors,
         and its relational metadata. Note: this also wipes graphiti's
@@ -323,14 +298,6 @@ class CogneeService:
         self.current_dataset = None
         self.run_id = uuid.uuid4().hex[:8]
         return {"backend": "cognee", "deleted": True}
-
-    def reset(self) -> Dict[str, Any]:
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop.run_until_complete(self.reset_async())
 
     async def remember_async(self, question: str) -> List[str]:
         if not self.current_dataset:
@@ -369,11 +336,3 @@ class CogneeService:
 
         logger.info("Cognee returned %d items", len(out))
         return out
-
-    def remember(self, question: str) -> List[str]:
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop.run_until_complete(self.remember_async(question))

@@ -4,15 +4,13 @@ Each `(name_prefix, memory, mode)` writes to its own file inside
 `RESULTS_DIR`, e.g. `test_mem0_unconstrained.csv`. Multiple conversations
 for the same backend/mode share a file; the row-level `conversation_index`
 column distinguishes them and `experiment_name` carries the conv tag
-(`{prefix}{memory}_conv{conv}_{mode}`). `experiment_id` remains a stable
-hash over (memory, conv, name_prefix, toxics) so per-conv resume keying
-stays unambiguous. Every /experiment call reads the matching file,
-filters by (conv, ...), and skips question entries already present.
+(`{prefix}{memory}_conv{conv}_{mode}`). Every /experiment call reads the
+matching file, filters by (conv, ...), and skips question entries
+already present.
 """
 from __future__ import annotations
 
 import csv
-import hashlib
 import os
 from pathlib import Path
 from typing import Any
@@ -20,11 +18,47 @@ from typing import Any
 RESULTS_DIR = Path(os.getenv("RESULTS_DIR", "/results"))
 
 COLUMNS = [
-    "timestamp", "experiment_id", "experiment_name", "phase",
-    "memory", "conversation_index", "name_prefix",
-    "seed", "question", "answer", "gold_answer",
-    "category",
-    "judge", "judge_reason",
+    # Front-loaded identifiers so a quick `head` on the CSV shows the
+    # experiment + when it ran before any of the noisy id/trace columns.
+    "experiment_name", "timestamp",
+    # Langfuse session id — `{experiment_name}_{run_id}`, where `run_id`
+    # is generated once per /experiment call so two runs of the same
+    # config land in two separate Langfuse sessions. Propagated to every
+    # span via the `langfuse.session.id` OTel attribute. Notebook builds
+    # the session URL as
+    # `${LANGFUSE_PUBLIC_URL}/project/dmas/sessions/{session_id}`.
+    "session_id",
+    # 32-hex OTel trace_id of the span that produced this row
+    # (warmup → `warmup`; load → `load.message`; ask → `ask.question`).
+    # Each row's primary span is its own detached-root trace, so this is
+    # the per-trace key. Use it to deep-link from a CSV row to the
+    # exact trace in Langfuse.
+    "trace_id",
+    # Ask rows only — trace_id of the `judge.evaluate` span (detached
+    # root, separate trace from `ask.question`). Lets the notebook deep-
+    # link from a CSV row to the judge's reasoning trace.
+    "judge_trace_id",
+    "phase",
+    "memory", "mode", "conversation_index",
+    # Per-ask retrieval stats. Only set on `phase=ask` rows; load/warmup
+    # rows leave these blank.
+    #   memories_returned — sum of memory items the responder received
+    #     across all search_memories tool calls for this question.
+    #   top_k — backend's configured retrieval ceiling (env
+    #     MEMORIES_SEARCH_LIMIT). Null for full_context which dumps the
+    #     whole conversation regardless of k.
+    #   search_calls — number of search_memories invocations the
+    #     responder made (typically 1).
+    "search_calls", "top_k", "memories_returned",
+    "question_category", "question", "answer", "gold_answer",
+    "seed",
+    # LLM-as-judge consensus.
+    #   judge_n       — number of independent judge calls per row
+    #                   (request's `llm_as_judge_seed`).
+    #   judge_verdict — final majority label (CORRECT iff strictly more
+    #                   than half the calls returned CORRECT, else WRONG;
+    #                   PLACEHOLDER/ERROR pass through if every call agrees).
+    "judge_n", "judge_verdict", "judge_reason",
     "toxic_latency", "toxic_jitter", "toxic_bandwidth",
     # wall_ms = compute_ms + flush_ms.
     #   compute_ms is the user-facing request latency (t_call_start →
@@ -44,49 +78,18 @@ COLUMNS = [
     "edge_llm_tokens", "edge_llm_cost_usd",
     "cloud_llm_tokens", "cloud_llm_cost_usd",
     "llm_tokens", "llm_cost_usd",
-    # Per-ask retrieval stats. Only set on `phase=ask` rows; load/warmup
-    # rows leave these blank.
-    #   coordinator_asked_responder — True if the SLM emitted the
-    #     ask_responder tool call, False if the fallback path was used
-    #     (qwen2.5:3b ignored tool_choice="required").
-    #   memories_returned — sum of memory items the responder received
-    #     across all search_memories tool calls for this question.
-    #   top_k — backend's configured retrieval ceiling (env
-    #     MEMORIES_SEARCH_LIMIT). Null for full_context which dumps the
-    #     whole conversation regardless of k.
-    #   search_calls — number of search_memories invocations the
-    #     responder made (typically 1).
-    #   responder_context_tokens — `prompt_tokens` of the OpenAI
-    #     completion that produced the final answer; the actual
-    #     context length the answering LLM consumed for this question.
-    #     Used in efficiency analyses to normalise accuracy by how
-    #     much retrieved context the responder had to process.
-    "coordinator_asked_responder", "memories_returned", "top_k", "search_calls",
-    "responder_context_tokens",
-    # LLM-as-judge consensus columns. The `judge` column carries the
-    # majority-vote final verdict; the columns below preserve the raw
-    # ballots so analyses can compute inter-judge agreement.
-    #   judge_n             — number of independent judge calls per row
-    #                         (LLM_AS_JUDGE_SEED on the request).
-    #   judge_correct_votes — count of those calls that returned CORRECT.
-    #   judge_labels        — pipe-separated list of every individual
-    #                         label, in call order (e.g. "CORRECT|WRONG|CORRECT").
-    "judge_n", "judge_correct_votes", "judge_labels",
+    # `prompt_tokens` of the OpenAI completion that produced the final
+    # answer — the actual context length the responder LLM consumed for
+    # this question. These columns are a SLICE of cloud_llm_tokens /
+    # cloud_llm_cost_usd (already counted there), tracked separately so
+    # efficiency analyses can normalise accuracy by how much retrieved
+    # context the responder had to process. Do NOT add them to llm_*
+    # totals — they're already included via cloud_*. The cost column
+    # prices the prompt slice through litellm's cost table for the
+    # responder model (rate stays in lockstep with the proxy config).
+    "responder_context_window_tokens", "responder_context_window_cost_usd",
     "error",
 ]
-
-_DEDUPE_KEY = (
-    "memory", "conversation_index", "name_prefix",
-    "toxic_latency", "toxic_jitter", "toxic_bandwidth",
-    "seed", "question",
-)
-_CONFIG_KEY = tuple(k for k in _DEDUPE_KEY if k not in ("seed", "question"))
-
-
-def experiment_id(row: dict[str, Any]) -> str:
-    raw = "|".join(str(row.get(k, "")) for k in _CONFIG_KEY)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
-
 
 def _is_constrained(latency: Any, jitter: Any, bandwidth: Any) -> bool:
     def _f(v: Any) -> float:
@@ -129,7 +132,6 @@ def _format_decimals(row: dict[str, Any]) -> None:
 
 
 def append_row(row: dict[str, Any]) -> None:
-    row["experiment_id"] = experiment_id(row)
     _format_decimals(row)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     path = _file_for_row(row)
@@ -141,30 +143,53 @@ def append_row(row: dict[str, Any]) -> None:
         w.writerow(row)
 
 
+def _iter_phase_rows(memory: str, conv_index: int, latency: float, jitter: float,
+                     bandwidth: float, name_prefix: str, phase: str,
+                     session_id: str | None):
+    """Yield CSV rows for the per-(memory, mode, prefix) file, filtered to
+    the requested phase + conversation_index (and optionally session_id).
+    Shared by `already_done` (phase=ask) and `loaded_messages` (phase=load)."""
+    path = file_for_config(memory, latency, jitter, bandwidth, name_prefix)
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    with path.open("r", newline="", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            if r.get("phase") != phase or r.get("conversation_index", "") != str(conv_index):
+                continue
+            if session_id is not None and r.get("session_id", "") != session_id:
+                continue
+            yield r
+
+
 def already_done(memory: str, conv_index: int, latency: float, jitter: float,
-                 bandwidth: float, name_prefix: str = "") -> set[str]:
+                 bandwidth: float, name_prefix: str = "",
+                 session_id: str | None = None) -> set[str]:
     """Return {question} text already present as ask-phase rows for this
     `(memory, conv, mode, prefix)` configuration. The bench now runs each
     question once (judging is repeated, not asking), so resume keys on
     `question` alone — `(seed, question)` no longer applies. Reads the
     `(memory, mode, prefix)` file and filters rows by `conversation_index`
     so multiple convs sharing the file don't collide.
+
+    When `session_id` is given, only rows tagged with the same session_id
+    are treated as resumable. Rows from prior runs (different session_id)
+    are NOT skipped, so a fresh /experiment call always re-asks even if
+    the (memory, conv, mode, prefix) file already has answers from an
+    earlier session. Pass session_id explicitly on /experiment to resume
+    a specific run.
     """
-    path = file_for_config(memory, latency, jitter, bandwidth, name_prefix)
-    if not path.exists() or path.stat().st_size == 0:
-        return set()
     done: set[str] = set()
-    with path.open("r", newline="", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            if r.get("phase") == "ask" and r.get("conversation_index", "") == str(conv_index):
-                q = r.get("question") or ""
-                if q:
-                    done.add(q)
+    for r in _iter_phase_rows(memory, conv_index, latency, jitter, bandwidth,
+                              name_prefix, phase="ask", session_id=session_id):
+        q = r.get("question") or ""
+        if q:
+            done.add(q)
     return done
 
 
 def loaded_messages(memory: str, conv_index: int, latency: float, jitter: float,
-                    bandwidth: float, name_prefix: str = "") -> set[str]:
+                    bandwidth: float, name_prefix: str = "",
+                    session_id: str | None = None) -> set[str]:
     """Return {message-counter} markers already saved for this config.
 
     Resume marker: each persisted message writes one row whose `question`
@@ -173,20 +198,21 @@ def loaded_messages(memory: str, conv_index: int, latency: float, jitter: float,
     granularity is per-message because each call to coordinator/memorize
     carries exactly one message. Filters by `conversation_index` since
     the file now holds rows from every conv for the same backend/mode.
+
+    When `session_id` is given, only rows tagged with the same session_id
+    count toward resume — load rows from prior sessions don't suppress a
+    fresh load. This pairs with `already_done` so a new /experiment call
+    (no `session_id` passed) starts clean instead of inheriting the
+    previous run's CSV state.
     """
-    path = file_for_config(memory, latency, jitter, bandwidth, name_prefix)
-    if not path.exists() or path.stat().st_size == 0:
-        return set()
     done: set[str] = set()
-    with path.open("r", newline="", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            if r.get("phase") == "load" and r.get("conversation_index", "") == str(conv_index):
-                q = r.get("question") or ""
-                if q:
-                    # Any prior attempt counts — including `skipped` (empty
-                    # turns the backend filtered out) and `failed`. Without
-                    # this, those rows would be re-POSTed on every resume
-                    # and pile up. To retry a failed row, delete it from
-                    # the per-experiment CSV first.
-                    done.add(q)
+    # Any prior attempt counts — including `skipped` (empty turns the
+    # backend filtered out) and `failed`. Without this, those rows would
+    # be re-POSTed on every resume and pile up. To retry a failed row,
+    # delete it from the per-experiment CSV first.
+    for r in _iter_phase_rows(memory, conv_index, latency, jitter, bandwidth,
+                              name_prefix, phase="load", session_id=session_id):
+        q = r.get("question") or ""
+        if q:
+            done.add(q)
     return done

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 import re
@@ -9,13 +10,48 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from mem0 import Memory
+from mem0.configs import prompts as _mem0_prompts
 from mem0.configs.base import MemoryConfig
 
-from app.services.litellm_usage import usage_snapshot, diff as usage_diff
+from shared.litellm_usage import usage_snapshot_sync as usage_snapshot, diff as usage_diff
 
 logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 1
+
+# Per-call session-date anchor for mem0's fact extractor.
+#
+# Why a ContextVar + monkey-patch: mem0's additive extraction prompt
+# stamps `## Current Date` via `_resolve_dates()`, which defaults to
+# `datetime.now()` because `Memory.add()` does NOT forward our
+# `metadata={"timestamp": ...}` into `generate_additive_extraction_prompt`
+# (mem0 v1.x). With a 2026-running container ingesting a 2023 LoCoMo
+# conversation, the LLM's anchor is "today" and it emits facts like
+# `"On 2026-05-02, User Caroline ..."` — wrong by years.
+#
+# We bind the active session's ISO date into this var before every
+# `memory.add()` and restore the original `_resolve_dates` afterwards;
+# the patched version reads the var and pins both the current and
+# observation dates to it, so the extractor's anchor matches the
+# conversation period.
+_active_session_date: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_active_session_date", default=None,
+)
+
+
+# Idempotent: re-importing this module (e.g. in test harnesses) must not
+# stack patches and must not lose the original function reference.
+if not getattr(_mem0_prompts, "_dmas_patched", False):
+    _orig_resolve_dates = _mem0_prompts._resolve_dates
+
+    def _patched_resolve_dates(current_date=None, observation_date=None):
+        pinned = _active_session_date.get()
+        if pinned and current_date is None:
+            current_date = pinned
+        return _orig_resolve_dates(current_date, observation_date)
+
+    _mem0_prompts._resolve_dates = _patched_resolve_dates
+    _mem0_prompts._dmas_patched = True
 
 
 def parse_locomo_date(date_str: str) -> datetime | None:
@@ -108,8 +144,13 @@ class Mem0Service:
 
     def __init__(self):
         self.TOP_K = int(os.getenv("MEMORIES_SEARCH_LIMIT", "20"))
+        self.memory = Memory(self._build_config())
+        self.run_id = uuid.uuid4().hex[:8]
+        self.current_user_id: str | None = None
 
-        config = MemoryConfig(
+    @staticmethod
+    def _build_config() -> MemoryConfig:
+        return MemoryConfig(
             llm={
                 "provider": "openai",
                 "config": {
@@ -123,11 +164,8 @@ class Mem0Service:
                     "host": os.getenv("QDRANT_HOST", "localhost"),
                     "port": int(os.getenv("QDRANT_PORT", "6333")),
                 },
-            }
+            },
         )
-        self.memory = Memory(config)
-        self.run_id = uuid.uuid4().hex[:8]
-        self.current_user_id: str | None = None
 
     def memorize_iter(self, conv_index: int, data: Dict[str, Any]):
         """Streaming generator: yields one event per add then a final
@@ -164,6 +202,11 @@ class Mem0Service:
                 continue
 
             session_epoch = locomo_date_to_epoch(date_str)
+            parsed_session_date = parse_locomo_date(date_str)
+            session_iso_date = (
+                parsed_session_date.replace(tzinfo=timezone.utc).date().isoformat()
+                if parsed_session_date else None
+            )
 
             for chunk_idx, messages in enumerate(chunks):
                 if any(not msg.get("content", "").strip() for msg in messages):
@@ -174,6 +217,7 @@ class Mem0Service:
 
                 m_t0 = time.monotonic()
                 u0 = usage_snapshot()
+                token = _active_session_date.set(session_iso_date)
                 try:
                     self.memory.add(
                         messages,
@@ -218,6 +262,8 @@ class Mem0Service:
                         "wall_ms": m_wall_ms,
                         **du,
                     }
+                finally:
+                    _active_session_date.reset(token)
 
         yield {
             "event": "done",
@@ -277,23 +323,7 @@ class Mem0Service:
         except Exception:
             logger.exception("mem0 reset: qdrant collection drop failed")
         # Re-instantiate Memory so it lazily recreates collections on next add.
-        config = MemoryConfig(
-            llm={
-                "provider": "openai",
-                "config": {
-                    "model": os.getenv("LLM_MODEL", "gpt-4o-mini"),
-                    "temperature": 0,
-                },
-            },
-            vector_store={
-                "provider": "qdrant",
-                "config": {
-                    "host": os.getenv("QDRANT_HOST", "localhost"),
-                    "port": int(os.getenv("QDRANT_PORT", "6333")),
-                },
-            }
-        )
-        self.memory = Memory(config)
+        self.memory = Memory(self._build_config())
         self.run_id = uuid.uuid4().hex[:8]
         self.current_user_id = None
         return {"backend": "mem0", "deleted": deleted}

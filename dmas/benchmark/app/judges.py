@@ -75,12 +75,12 @@ def _call(model: str, system: str, user: str) -> str:
     return resp.choices[0].message.content or ""
 
 
-def judge(question: str, gold_answer: str, response: str, session_date: str = "") -> JudgeResult:
+def judge(question: str, gold_answer: str, response: str) -> JudgeResult:
     if not judge_prompts.JUDGE_PROMPT_TEMPLATE:
         return JudgeResult(label="PLACEHOLDER", reasoning="judge not implemented")
     if not gold_answer or not response:
         return JudgeResult(label="WRONG")
-    user = judge_prompts.get_judge_prompt(question=question, gold_answer=gold_answer, response=response, session_date=session_date)
+    user = judge_prompts.get_judge_prompt(question=question, gold_answer=gold_answer, response=response)
     try:
         label, reason = _grade_label(_call(judge_prompts.JUDGE_MODEL, judge_prompts.JUDGE_SYSTEM_PROMPT, user))
         return JudgeResult(label=label, reasoning=reason)
@@ -89,20 +89,22 @@ def judge(question: str, gold_answer: str, response: str, session_date: str = ""
 
 
 def judge_majority(question: str, gold_answer: str, response: str,
-                   session_date: str = "", n: int = 3) -> JudgeAggregate:
+                   n: int = 3) -> JudgeAggregate:
     """Run `judge` n independent times and majority-vote the verdict.
 
     Consensus protocol: CORRECT iff strictly more than half the calls
-    returned CORRECT (so for n=3 the threshold is 2). PLACEHOLDER and
-    ERROR are surfaced as-is when n=1 to keep parity with single-call
-    semantics; otherwise they count as WRONG for the vote.
+    returned CORRECT (so for n=3 the threshold is 2). When every vote
+    agrees on a non-CORRECT/non-WRONG label (e.g. a unanimous PLACEHOLDER
+    or ERROR run), that label is propagated as the verdict so an
+    unimplemented or broken judge isn't masked by a default WRONG.
+    Otherwise non-CORRECT votes count as WRONG for the tally.
     """
     if n < 1:
         n = 1
     votes: list[str] = []
     reasonings: list[str] = []
     for _ in range(n):
-        r = judge(question, gold_answer, response, session_date)
+        r = judge(question, gold_answer, response)
         votes.append(r.label)
         if r.reasoning:
             reasonings.append(r.reasoning)

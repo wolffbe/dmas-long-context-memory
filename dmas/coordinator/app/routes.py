@@ -10,16 +10,20 @@ from __future__ import annotations
 import os
 from typing import Any
 
-# Import BEFORE the service — patches openai chat/embeddings/responses
-# `create` to inject `metadata.tags` so litellm tags the trace.
-from app import langfuse_tags  # noqa: F401
+from shared import otel_init
+
+otel_init.init("coordinator")
+otel_init.instrument_requests()
+otel_init.instrument_httpx()
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from app.coordinator_service import CoordinatorService
+from shared.models import ResetRequest, WarmupRequest
 
 app = FastAPI(title="coordinator", version="2.0")
+otel_init.instrument_fastapi(app)
 
 coordinator = CoordinatorService(
     memory_url=os.getenv("MEMORY_URL", "http://toxiproxy:18005"),
@@ -31,21 +35,31 @@ coordinator = CoordinatorService(
 class AskRequest(BaseModel):
     question: str
     backend: str
+    # LoCoMo session date string for the question's evidence
+    # ("8 May 2023 at 4:42 pm"). The responder uses this as the anchor
+    # when resolving relative time references ("yesterday", "last week"),
+    # since gpt-4o-mini otherwise falls back to its training cutoff.
+    session_date: str = ""
+    # Forwarded to the responder so its detached `responder.respond`
+    # root span lands in the same langfuse session and carries the same
+    # tags as the bench's `ask.question` and `load.message` traces.
+    session_id: str | None = None
+    conv_index: int | None = None
+    mode: str | None = None
 
 
 class MemorizeRequest(BaseModel):
     backend: str
     conv_index: int
     data: dict[str, Any]
-
-
-class ResetRequest(BaseModel):
-    backend: str
-
-
-class WarmupRequest(BaseModel):
-    backend: str
-    conv_index: int
+    # Optional caller-supplied langfuse trace ID. When set, every
+    # memory-side LLM call this /memorize produces is pinned to it; when
+    # absent the coordinator mints one and returns it on the response.
+    trace_id: str | None = None
+    # Forwarded to memory so the per-framework save span lands in the
+    # same langfuse session as the bench's load.message trace.
+    session_id: str | None = None
+    mode: str | None = None
 
 
 @app.get("/health")
@@ -55,7 +69,10 @@ async def health():
 
 @app.post("/ask")
 async def ask(req: AskRequest):
-    result = coordinator.ask(question=req.question, backend=req.backend)
+    result = coordinator.ask(question=req.question, backend=req.backend,
+                             session_date=req.session_date,
+                             session_id=req.session_id,
+                             conv_index=req.conv_index, mode=req.mode)
     if result.get("status") == "error":
         raise HTTPException(500, result.get("error"))
     return result
@@ -68,7 +85,9 @@ async def memorize(req: MemorizeRequest):
     Bench drives granularity: one call typically carries a single message,
     so the response confirms exactly that message was persisted.
     """
-    result = coordinator.memorize(backend=req.backend, conv_index=req.conv_index, data=req.data)
+    result = coordinator.memorize(backend=req.backend, conv_index=req.conv_index,
+                                  data=req.data, trace_id=req.trace_id,
+                                  session_id=req.session_id, mode=req.mode)
     if result.get("status") == "error":
         raise HTTPException(502, result.get("error"))
     return result

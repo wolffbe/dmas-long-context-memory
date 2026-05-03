@@ -1,6 +1,6 @@
-.PHONY: build setup start stop clean reset \
-        experiment experiment-leg experiment-test experiments logs ps \
-        _check_docker _check_openai _check_langfuse_keys _bootstrap_env_file \
+.PHONY: build start stop clean reset \
+        experiment experiment-leg experiment-test experiment-test-s experiment-test-l experiments logs ps \
+        _check_docker _check_openai _bootstrap_env_file _refresh_public_url \
         _wait_benchmark _wait_langfuse
 
 PY ?= python3
@@ -33,53 +33,27 @@ MEMORY_VOLUMES  := \
 ALL_VOLUMES := \
 	$(MEMORY_VOLUMES) \
 	$(COMPOSE_PROJECT)_ollama_data \
-	$(COMPOSE_PROJECT)_langfuse-db-data
+	$(COMPOSE_PROJECT)_langfuse-db-data \
+	$(COMPOSE_PROJECT)_langfuse-clickhouse-data \
+	$(COMPOSE_PROJECT)_langfuse-clickhouse-logs \
+	$(COMPOSE_PROJECT)_langfuse-minio-data
 
 # === lifecycle ============================================================
 
 # Build all images. Aborts if OPENAI_API_KEY is missing — every backend (mem0
 # fact-extraction, graphiti node/edge extraction, judge eval, responder)
 # needs it, so building without it just produces images that won't run.
-build: _check_docker _bootstrap_env_file _check_openai
+build: _check_docker _bootstrap_env_file _refresh_public_url _check_openai
 	@echo "==> building dmas (--no-cache --pull)"
 	docker compose --env-file .env -f $(DMAS_COMPOSE) build --no-cache --pull
-	@echo "==> build complete. Run 'make setup' next."
+	@URL=$$(. ./.env 2>/dev/null; printf '%s' "$$LANGFUSE_PUBLIC_URL"); \
+	echo "==> build complete. LANGFUSE_PUBLIC_URL=$$URL"; \
+	echo "==> Run 'make start' next."
 
-# One-time bootstrap: bring Langfuse up alone, prompt for API keys, persist
-# them to .env. After this, `make start` brings the rest of the stack up
-# with traces wired through litellm. Subsequent runs only need `make start`.
-setup: _check_docker _bootstrap_env_file
-	@docker network create dmas-network 2>/dev/null || true
-	@echo "==> starting langfuse..."
-	docker compose --env-file .env -f $(DMAS_COMPOSE) up -d langfuse-db langfuse-web
-	@$(MAKE) _wait_langfuse
-	@PUBLIC_URL=$$(. ./.env 2>/dev/null; printf '%s' "$${LANGFUSE_PUBLIC_URL:-$(LANGFUSE_URL)}"); \
-	echo ""; \
-	echo "==> Langfuse is up at $$PUBLIC_URL"; \
-	echo ""; \
-	echo "  1. Open it in a browser"; \
-	echo "  2. Sign in (default: dev@local.dev / devdevdev) or sign up"; \
-	echo "  3. Create or open a project, then Settings -> API Keys"; \
-	echo "  4. Generate a keypair and paste below"; \
-	echo ""; \
-	printf 'LANGFUSE_PUBLIC_KEY (pk-lf-...): '; read pk; \
-	printf 'LANGFUSE_SECRET_KEY (sk-lf-...): '; read sk; \
-	if [ -z "$$pk" ] || [ -z "$$sk" ]; then \
-		echo "ERROR: empty key — aborting without writing .env"; exit 2; \
-	fi; \
-	case "$$pk" in pk-lf-*) ;; *) echo "ERROR: public key must start with pk-lf-"; exit 2 ;; esac; \
-	case "$$sk" in sk-lf-*) ;; *) echo "ERROR: secret key must start with sk-lf-"; exit 2 ;; esac; \
-	tmp=$$(mktemp); \
-	grep -v -E '^LANGFUSE_(PUBLIC|SECRET)_KEY=' .env > $$tmp; \
-	printf 'LANGFUSE_PUBLIC_KEY=%s\nLANGFUSE_SECRET_KEY=%s\n' "$$pk" "$$sk" >> $$tmp; \
-	mv $$tmp .env; \
-	echo ""; \
-	echo "==> wrote LANGFUSE_PUBLIC_KEY/SECRET_KEY to .env"; \
-	echo "==> run 'make start' to bring up the rest of the stack"
-
-# Bring up the full stack. Assumes `make setup` has been run once so the
-# langfuse keys are in .env — `_check_langfuse_keys` aborts otherwise.
-start: _check_docker _bootstrap_env_file _check_openai _check_langfuse_keys
+# Bring up the full stack headlessly. `_bootstrap_env_file` auto-
+# generates the langfuse pk/sk + OTel basic-auth header into .env on
+# first run; langfuse v3 picks them up via LANGFUSE_INIT_PROJECT_*.
+start: _check_docker _bootstrap_env_file _check_openai
 	@docker network create dmas-network 2>/dev/null || true
 	@echo "==> starting full dmas stack"
 	docker compose --env-file .env -f $(DMAS_COMPOSE) up -d --remove-orphans
@@ -143,6 +117,72 @@ _bootstrap_env_file:
 		echo "LANGFUSE_ENCRYPTION_KEY=$$val" >> .env; \
 		echo "==> generated LANGFUSE_ENCRYPTION_KEY (256-bit hex)"; \
 	fi
+	@TOKEN=$$(curl -fsS -m 1 -X PUT 'http://169.254.169.254/latest/api/token' \
+		-H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null || true); \
+	IP=""; \
+	if [ -n "$$TOKEN" ]; then \
+		IP=$$(curl -fsS -m 1 -H "X-aws-ec2-metadata-token: $$TOKEN" \
+			http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || true); \
+	fi; \
+	if [ -n "$$IP" ]; then \
+		NEW_URL="http://$$IP:3000"; \
+		OLD_URL=$$(. ./.env 2>/dev/null; printf '%s' "$$LANGFUSE_PUBLIC_URL"); \
+		grep -v '^LANGFUSE_PUBLIC_URL=' .env > .env.tmp; mv .env.tmp .env; \
+		echo "LANGFUSE_PUBLIC_URL=$$NEW_URL" >> .env; \
+		if [ "$$OLD_URL" != "$$NEW_URL" ]; then \
+			echo "==> refreshed EC2 public IP: LANGFUSE_PUBLIC_URL=$$NEW_URL (was: $${OLD_URL:-unset})"; \
+		fi; \
+	elif ! grep -q '^LANGFUSE_PUBLIC_URL=http' .env; then \
+		echo "LANGFUSE_PUBLIC_URL=http://localhost:3000" >> .env; \
+		echo "==> no EC2 metadata; LANGFUSE_PUBLIC_URL defaulted to localhost"; \
+	fi
+	@if ! grep -q '^LANGFUSE_PUBLIC_KEY=pk-lf-' .env; then \
+		val=pk-lf-$$(openssl rand -hex 16); \
+		grep -v '^LANGFUSE_PUBLIC_KEY=' .env > .env.tmp; mv .env.tmp .env; \
+		echo "LANGFUSE_PUBLIC_KEY=$$val" >> .env; \
+		echo "==> generated LANGFUSE_PUBLIC_KEY (headless bootstrap)"; \
+	fi
+	@if ! grep -q '^LANGFUSE_SECRET_KEY=sk-lf-' .env; then \
+		val=sk-lf-$$(openssl rand -hex 24); \
+		grep -v '^LANGFUSE_SECRET_KEY=' .env > .env.tmp; mv .env.tmp .env; \
+		echo "LANGFUSE_SECRET_KEY=$$val" >> .env; \
+		echo "==> generated LANGFUSE_SECRET_KEY (headless bootstrap)"; \
+	fi
+	@PK=$$(. ./.env 2>/dev/null; printf '%s' "$$LANGFUSE_PUBLIC_KEY"); \
+	SK=$$(. ./.env 2>/dev/null; printf '%s' "$$LANGFUSE_SECRET_KEY"); \
+	AUTH=$$(printf '%s:%s' "$$PK" "$$SK" | base64 -w0 2>/dev/null || printf '%s:%s' "$$PK" "$$SK" | base64); \
+	grep -v '^LANGFUSE_OTEL_BASIC_AUTH=' .env > .env.tmp; mv .env.tmp .env; \
+	echo "LANGFUSE_OTEL_BASIC_AUTH=$$AUTH" >> .env; \
+	echo "==> wrote LANGFUSE_OTEL_BASIC_AUTH (litellm OTel exporter)"
+
+# Force-refresh LANGFUSE_PUBLIC_URL from EC2 metadata. Runs in addition
+# to the IP block inside _bootstrap_env_file so `make build` always
+# rewrites the URL even if the file already had a value, and so the
+# behavior is independent of bootstrap's other side-effects (key
+# generation etc.). On non-EC2 hosts metadata times out in 1s and the
+# previous value is kept.
+_refresh_public_url:
+	@TOKEN=$$(curl -fsS -m 1 -X PUT 'http://169.254.169.254/latest/api/token' \
+		-H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null || true); \
+	IP=""; \
+	if [ -n "$$TOKEN" ]; then \
+		IP=$$(curl -fsS -m 1 -H "X-aws-ec2-metadata-token: $$TOKEN" \
+			http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || true); \
+	fi; \
+	if [ -n "$$IP" ]; then \
+		NEW_URL="http://$$IP:3000"; \
+		OLD_URL=$$(. ./.env 2>/dev/null; printf '%s' "$$LANGFUSE_PUBLIC_URL"); \
+		grep -v '^LANGFUSE_PUBLIC_URL=' .env > .env.tmp; mv .env.tmp .env; \
+		echo "LANGFUSE_PUBLIC_URL=$$NEW_URL" >> .env; \
+		if [ "$$OLD_URL" != "$$NEW_URL" ]; then \
+			echo "==> refreshed EC2 public IP: LANGFUSE_PUBLIC_URL=$$NEW_URL (was: $${OLD_URL:-unset})"; \
+		else \
+			echo "==> LANGFUSE_PUBLIC_URL already current: $$NEW_URL"; \
+		fi; \
+	else \
+		CURR=$$(. ./.env 2>/dev/null; printf '%s' "$$LANGFUSE_PUBLIC_URL"); \
+		echo "==> EC2 metadata unavailable; keeping LANGFUSE_PUBLIC_URL=$${CURR:-unset}"; \
+	fi
 
 _check_openai:
 	@OPENAI=$$(. ./.env 2>/dev/null; printf '%s' "$$OPENAI_API_KEY"); \
@@ -152,17 +192,6 @@ _check_openai:
 		echo "       Used by: litellm openai/* route, mem0 fact-extraction,"; \
 		echo "       graphiti node/edge extraction, responder, and the judge."; \
 		echo "       Add a line to .env: OPENAI_API_KEY=sk-..."; \
-		echo ""; \
-		exit 1; \
-	fi
-
-_check_langfuse_keys:
-	@PK=$$(. ./.env 2>/dev/null; printf '%s' "$$LANGFUSE_PUBLIC_KEY"); \
-	SK=$$(. ./.env 2>/dev/null; printf '%s' "$$LANGFUSE_SECRET_KEY"); \
-	if [ -z "$$PK" ] || [ -z "$$SK" ]; then \
-		echo ""; \
-		echo "ERROR: LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY missing from .env"; \
-		echo "       Run 'make setup' first to bring Langfuse up and capture the keys."; \
 		echo ""; \
 		exit 1; \
 	fi
@@ -274,6 +303,67 @@ experiment:
 				LLM_AS_JUDGE_SEED=$(LLM_AS_JUDGE_SEED) \
 				BACKENDS="$(BACKENDS)" || exit $$?; \
 		done; \
+	done
+
+# Short smoke: load the first 5 messages of CONV (default 0), ask the
+# first question of LoCoMo category 2 (multi-hop), across BOTH regimes,
+# across every backend in BACKENDS. Single judge call per answer to keep
+# wall time low. KEEP_STATE so the constrained leg reuses the
+# unconstrained leg's load.
+#   make experiment-test-s
+#   make experiment-test-s CONV=3
+TEST_S_CONV          ?= 0
+TEST_S_MESSAGES      ?= 5
+TEST_S_QUESTION_TYPES ?= 2
+TEST_S_Q_PER_TYPE    ?= 1
+TEST_S_NAME_PREFIX   ?= test_s_
+# Smoke runs default to a single judge call for speed. A command-line
+# override (`make experiment-test-s LLM_AS_JUDGE_SEED=3`) wins via
+# `$(origin)`, but the top-level default of 3 doesn't leak into the smoke.
+TEST_S_LLM_AS_JUDGE_SEED ?= 1
+experiment-test-s:
+	@CONV_VAL="$(or $(CONV),$(TEST_S_CONV))"; \
+	SEED="$(if $(filter command,$(origin LLM_AS_JUDGE_SEED)),$(LLM_AS_JUDGE_SEED),$(TEST_S_LLM_AS_JUDGE_SEED))"; \
+	for mode in unconstrained constrained; do \
+		echo "==> smoke-S $$mode leg (CONV=$$CONV_VAL BACKENDS='$(BACKENDS)' MESSAGES=$(TEST_S_MESSAGES) QT=$(TEST_S_QUESTION_TYPES) Q_PER_TYPE=$(TEST_S_Q_PER_TYPE) LLM_AS_JUDGE_SEED=$$SEED)"; \
+		$(MAKE) experiment-leg \
+			CONV=$$CONV_VAL MODE=$$mode \
+			LLM_AS_JUDGE_SEED=$$SEED \
+			MESSAGES=$(TEST_S_MESSAGES) \
+			QUESTION_TYPES=$(TEST_S_QUESTION_TYPES) \
+			Q_PER_TYPE=$(TEST_S_Q_PER_TYPE) \
+			KEEP_STATE=1 \
+			NAME_PREFIX=$(TEST_S_NAME_PREFIX) \
+			BACKENDS="$(BACKENDS)" || exit $$?; \
+	done
+
+# Long smoke: load the first 199 messages of CONV (default 0), ask the
+# first 3 questions per LoCoMo category 1-4 (single-hop, multi-hop,
+# temporal, open-domain), across BOTH regimes, across every backend in
+# BACKENDS. Single judge call per answer; KEEP_STATE so the constrained
+# leg reuses the unconstrained load.
+#   make experiment-test-l
+#   make experiment-test-l CONV=2 BACKENDS="mem0 graphiti"
+TEST_L_CONV          ?= 0
+TEST_L_MESSAGES      ?= 199
+TEST_L_QUESTION_TYPES ?= 1,2,3,4
+TEST_L_Q_PER_TYPE    ?= 3
+TEST_L_NAME_PREFIX   ?= test_l_
+TEST_L_LLM_AS_JUDGE_SEED ?= 1
+experiment-test-l:
+	@CONV_VAL="$(or $(CONV),$(TEST_L_CONV))"; \
+	SEED="$(if $(filter command,$(origin LLM_AS_JUDGE_SEED)),$(LLM_AS_JUDGE_SEED),$(TEST_L_LLM_AS_JUDGE_SEED))"; \
+	for mode in unconstrained constrained; do \
+		echo "==> smoke-L $$mode leg (CONV=$$CONV_VAL BACKENDS='$(BACKENDS)' MESSAGES=$(TEST_L_MESSAGES) QT=$(TEST_L_QUESTION_TYPES) Q_PER_TYPE=$(TEST_L_Q_PER_TYPE) LLM_AS_JUDGE_SEED=$$SEED)"; \
+		$(MAKE) experiment-leg \
+			CONV=$$CONV_VAL MODE=$$mode \
+			LLM_AS_JUDGE_SEED=$$SEED \
+			MESSAGES=$(TEST_L_MESSAGES) \
+			QUESTION_TYPES=$(TEST_L_QUESTION_TYPES) \
+			Q_PER_TYPE=$(TEST_L_Q_PER_TYPE) \
+			KEEP_STATE=1 \
+			NAME_PREFIX=$(TEST_L_NAME_PREFIX) \
+			BACKENDS="$(BACKENDS)" || exit $$?; \
 	done
 
 # Back-compat alias — `make experiments` (plural) used to dispatch the

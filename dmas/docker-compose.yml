@@ -10,12 +10,29 @@ services:
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
-      # Langfuse callback — every completion routed through this litellm
-      # is traced (prompt + completion + usage). Keys must match the
-      # langfuse-web LANGFUSE_INIT_PROJECT_* below.
+      # OTel callback — each completion is exported as a `gen_ai.*` span
+      # via OTLP/HTTP to langfuse-web v3. Replaces the v2 Langfuse SDK
+      # callback so generations nest under the caller's manual span
+      # (e.g. `memory.persist`) via W3C traceparent propagation.
       - LANGFUSE_HOST=http://langfuse-web:3000
       - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
       - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://langfuse-web:3000/api/public/otel
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+      - OTEL_SERVICE_NAME=litellm
+      # Tell litellm proxy's OTel callback (traceloop-based) to include
+      # prompt + completion text in the `gen_ai`/`raw_gen_ai_request`
+      # spans. Off by default to avoid leaking PII; without it, langfuse
+      # generations show usage/cost but the input/output panels stay
+      # empty. `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` is
+      # for the upstream OpenAI instrumentation; litellm proxy ignores
+      # it and uses TRACELOOP_TRACE_CONTENT instead.
+      - TRACELOOP_TRACE_CONTENT=true
+      # Authorization header is base64(public:secret); operator should
+      # set LANGFUSE_OTEL_BASIC_AUTH in .env (or a make target generates
+      # it). The `:-` fallback keeps the env defined when keys are absent
+      # so the container still boots.
+      - OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic ${LANGFUSE_OTEL_BASIC_AUTH:-}
     command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
     networks:
       - dmas-network
@@ -29,12 +46,18 @@ services:
         max-file: "3"
         compress: "true"
 
-  # Self-hosted Langfuse v2 (single web container + postgres). Used to
-  # inspect every prompt LiteLLM routes — see localhost:3000 after
-  # `make start`. Login: dev@local / devdevdev. Project keys are
-  # auto-bootstrapped on the postgres first-boot via LANGFUSE_INIT_*
-  # so they match the values litellm sends. v2 is chosen over v3
-  # because it doesn't require clickhouse/redis/minio.
+  # Self-hosted Langfuse v3 (web + worker + postgres + clickhouse + redis +
+  # minio). v3 was chosen over v2 to enable OTLP ingest at
+  # /api/public/otel/v1/traces — every service emits OTel spans (FastAPI
+  # inbound, httpx/requests outbound, manual `memory.persist` etc.) and
+  # litellm forwards `gen_ai.*` generations via its `otel` success
+  # callback. None of the langfuse infra carries a `group=` label —
+  # langfuse is observability, not part of the system under test, and
+  # `cgroup_metrics.py` filters on group ∈ {edge, cloud}; tagging it
+  # would inflate the cloud-side resource accounting in every CSV row.
+  # Project keys + user are still auto-bootstrapped via LANGFUSE_INIT_*
+  # on the postgres first-boot so litellm + the OTLP exporter use the
+  # same Basic-auth pair the operator sees in the UI.
   langfuse-db:
     image: postgres:15
     container_name: langfuse-db
@@ -52,16 +75,126 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
-    labels:
-      - "group=cloud"
+    # No `group=` label — langfuse infra is observability, not part of
+    # the system under test. Bench cgroup metrics filter on group ∈
+    # {edge, cloud}; tagging langfuse would inflate cloud totals.
+
+  langfuse-clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: langfuse-clickhouse
+    environment:
+      - CLICKHOUSE_DB=default
+      - CLICKHOUSE_USER=clickhouse
+      - CLICKHOUSE_PASSWORD=clickhouse
+    volumes:
+      - langfuse-clickhouse-data:/var/lib/clickhouse
+      - langfuse-clickhouse-logs:/var/log/clickhouse-server
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    networks:
+      - dmas-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  langfuse-redis:
+    image: redis:7-alpine
+    container_name: langfuse-redis
+    command: ["redis-server", "--requirepass", "redis", "--maxmemory-policy", "noeviction"]
+    networks:
+      - dmas-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  langfuse-minio:
+    image: minio/minio:latest
+    container_name: langfuse-minio
+    entrypoint: ["sh", "-c"]
+    # `mc mb --ignore-existing` makes the bucket idempotent on every boot.
+    command:
+      - |
+        mkdir -p /data/langfuse
+        minio server /data --address ':9000' --console-address ':9001'
+    environment:
+      - MINIO_ROOT_USER=minio
+      - MINIO_ROOT_PASSWORD=miniosecret
+    volumes:
+      - langfuse-minio-data:/data
+    networks:
+      - dmas-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3.172.1
+    container_name: langfuse-worker
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      - SALT=${LANGFUSE_SALT:?set LANGFUSE_SALT in .env}
+      - ENCRYPTION_KEY=${LANGFUSE_ENCRYPTION_KEY:?set LANGFUSE_ENCRYPTION_KEY in .env (64 hex chars)}
+      - TELEMETRY_ENABLED=false
+      - CLICKHOUSE_URL=http://langfuse-clickhouse:8123
+      - CLICKHOUSE_MIGRATION_URL=clickhouse://langfuse-clickhouse:9000
+      - CLICKHOUSE_USER=clickhouse
+      - CLICKHOUSE_PASSWORD=clickhouse
+      - CLICKHOUSE_CLUSTER_ENABLED=false
+      - REDIS_HOST=langfuse-redis
+      - REDIS_PORT=6379
+      - REDIS_AUTH=redis
+      - LANGFUSE_S3_EVENT_UPLOAD_BUCKET=langfuse
+      - LANGFUSE_S3_EVENT_UPLOAD_REGION=auto
+      - LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID=minio
+      - LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY=miniosecret
+      - LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT=http://langfuse-minio:9000
+      - LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE=true
+      - LANGFUSE_S3_EVENT_UPLOAD_PREFIX=events/
+      - LANGFUSE_S3_MEDIA_UPLOAD_BUCKET=langfuse
+      - LANGFUSE_S3_MEDIA_UPLOAD_REGION=auto
+      - LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID=minio
+      - LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY=miniosecret
+      - LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT=http://langfuse-minio:9000
+      - LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE=true
+      - LANGFUSE_S3_MEDIA_UPLOAD_PREFIX=media/
+    networks:
+      - dmas-network
+    restart: unless-stopped
 
   langfuse-web:
-    # Pinned to a v2 tag known to accept LANGFUSE_INIT_* bootstrap.
-    image: langfuse/langfuse:2.93.7
+    image: langfuse/langfuse:3.172.1
     container_name: langfuse-web
     depends_on:
       langfuse-db:
         condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+      langfuse-worker:
+        condition: service_started
     ports:
       # Bound to all interfaces so it's reachable on the EC2 public IP.
       # The EC2 security group still has to allow inbound 3000.
@@ -78,20 +211,45 @@ services:
       - SALT=${LANGFUSE_SALT:?set LANGFUSE_SALT in .env}
       - ENCRYPTION_KEY=${LANGFUSE_ENCRYPTION_KEY:?set LANGFUSE_ENCRYPTION_KEY in .env (64 hex chars)}
       - TELEMETRY_ENABLED=false
+      - CLICKHOUSE_URL=http://langfuse-clickhouse:8123
+      - CLICKHOUSE_MIGRATION_URL=clickhouse://langfuse-clickhouse:9000
+      - CLICKHOUSE_USER=clickhouse
+      - CLICKHOUSE_PASSWORD=clickhouse
+      - CLICKHOUSE_CLUSTER_ENABLED=false
+      - REDIS_HOST=langfuse-redis
+      - REDIS_PORT=6379
+      - REDIS_AUTH=redis
+      - LANGFUSE_S3_EVENT_UPLOAD_BUCKET=langfuse
+      - LANGFUSE_S3_EVENT_UPLOAD_REGION=auto
+      - LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID=minio
+      - LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY=miniosecret
+      - LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT=http://langfuse-minio:9000
+      - LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE=true
+      - LANGFUSE_S3_EVENT_UPLOAD_PREFIX=events/
+      - LANGFUSE_S3_MEDIA_UPLOAD_BUCKET=langfuse
+      - LANGFUSE_S3_MEDIA_UPLOAD_REGION=auto
+      - LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID=minio
+      - LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY=miniosecret
+      - LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT=http://langfuse-minio:9000
+      - LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE=true
+      - LANGFUSE_S3_MEDIA_UPLOAD_PREFIX=media/
       # First-boot bootstrap: only fires when the postgres data dir is empty.
       # After that, manage user/projects/keys through the UI.
       - LANGFUSE_INIT_ORG_ID=dmas
       - LANGFUSE_INIT_ORG_NAME=dmas
-      - LANGFUSE_INIT_PROJECT_ID=dmas-local
-      - LANGFUSE_INIT_PROJECT_NAME=dmas-local
+      - LANGFUSE_INIT_PROJECT_ID=dmas
+      - LANGFUSE_INIT_PROJECT_NAME=dmas
+      # Headless bootstrap: project keys come from .env (auto-generated
+      # by `_bootstrap_env_file` with the pk-lf-/sk-lf- prefixes langfuse
+      # validates). No UI dance — `make setup` is non-interactive.
+      - LANGFUSE_INIT_PROJECT_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_INIT_PROJECT_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
       - LANGFUSE_INIT_USER_EMAIL=dev@local.dev
       - LANGFUSE_INIT_USER_NAME=dev
       - LANGFUSE_INIT_USER_PASSWORD=devdevdev
     networks:
       - dmas-network
     restart: unless-stopped
-    labels:
-      - "group=cloud"
 
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:latest
@@ -109,8 +267,8 @@ services:
 
   benchmark:
     build:
-      context: ./benchmark
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: benchmark/Dockerfile
     container_name: benchmark
     ports:
       - "127.0.0.1:8002:8000"
@@ -124,6 +282,11 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
       - RESULTS_DIR=/results
+      - LANGFUSE_HOST=http://langfuse-web:3000
+      - LANGFUSE_PUBLIC_URL=${LANGFUSE_PUBLIC_URL:-http://localhost:3000}
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
+      - LANGFUSE_PROJECT_ID=${LANGFUSE_PROJECT_ID:-dmas}
     volumes:
       - ../experiments/results:/results
       - /sys/fs/cgroup:/host-cgroup:ro
@@ -174,8 +337,8 @@ services:
       - "group=cloud"
   memory:
     build:
-      context: ./memory
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: memory/Dockerfile
     container_name: memory
     # Port exposed only via toxiproxy (host 8005 -> toxiproxy 18005 -> memory 8002)
     depends_on:
@@ -195,7 +358,9 @@ services:
       - RAG_EMBED_DIM=${RAG_EMBED_DIM:-1536}
       - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
-      - LANGFUSE_SERVICE_TAG=memory
+      - LANGFUSE_HOST=http://langfuse-web:3000
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
     ulimits:
       # Cognee 0.5.x stages each `add` to disk and opens a new
       # SQLAlchemy/aiosqlite session per `cognify`. With our per-message
@@ -214,8 +379,8 @@ services:
       - "group=cloud"
   responder:
     build:
-      context: ./responder
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: responder/Dockerfile
     container_name: responder
     # Port exposed only via toxiproxy (host 8006 -> toxiproxy 18006 -> responder 8003)
     environment:
@@ -223,7 +388,9 @@ services:
       - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
       - OPENAI_BASE_URL=${LITELLM_OPENAI_BASE_URL:-http://litellm:4000/v1}
       - MEMORY_URL=${MEMORY_URL:-http://toxiproxy:18005}
-      - LANGFUSE_SERVICE_TAG=responder
+      - LANGFUSE_HOST=http://langfuse-web:3000
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
     networks:
       - dmas-network
     restart: unless-stopped
@@ -269,8 +436,8 @@ services:
       - "group=edge"
   coordinator:
     build:
-      context: ./coordinator
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: coordinator/Dockerfile
     container_name: coordinator
     ports:
       - "127.0.0.1:8003:8001"
@@ -291,7 +458,9 @@ services:
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://litellm:4000/v1}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
       - OPENAI_API_KEY=${LITELLM_OPENAI_API_KEY:-sk-litellm-master}
-      - LANGFUSE_SERVICE_TAG=coordinator
+      - LANGFUSE_HOST=http://langfuse-web:3000
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
     networks:
       - dmas-network
     restart: unless-stopped
@@ -310,9 +479,12 @@ volumes:
   ollama_data:
     labels:
       group: edge
-  langfuse-db-data:
-    labels:
-      group: cloud
+  # Langfuse infra volumes are intentionally unlabelled — see langfuse
+  # service block above.
+  langfuse-db-data: {}
+  langfuse-clickhouse-data: {}
+  langfuse-clickhouse-logs: {}
+  langfuse-minio-data: {}
 networks:
   dmas-network:
     external: true

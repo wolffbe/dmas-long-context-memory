@@ -21,26 +21,39 @@ streamed back to the caller.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import datetime as dt
 import json
 import logging
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any
+
+from shared import otel_init
+
+otel_init.init("benchmark")
+otel_init.instrument_httpx()
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
+from opentelemetry import trace as otel_trace
+from opentelemetry.context import Context as OTelContext
+from opentelemetry.trace import format_trace_id
+
 from app.agents import post_ask, post_memorize, post_reset, post_warmup
 from app.judges import judge_majority
 from app.locomo_service import LocomoService
 from app.results import RESULTS_DIR, already_done, append_row, loaded_messages
-from app.litellm_usage import usage_snapshot as litellm_usage_snapshot, diff as litellm_usage_diff
+from shared.litellm_usage import usage_snapshot_async as litellm_usage_snapshot, diff as litellm_usage_diff
 from app.cgroup_metrics import snapshot as cgroup_snapshot, delta as cgroup_delta, wait_io_quiet as cgroup_wait_io_quiet
 from app.toxics import apply_all, verify_all
+
+_tracer = otel_trace.get_tracer(__name__)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [bench] %(levelname)s %(message)s")
 log = logging.getLogger("benchmark")
@@ -70,6 +83,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="benchmark", version="2.0", lifespan=lifespan)
+otel_init.instrument_fastapi(app)
 
 storage = LocomoService(
     data_url=os.getenv("DATA_URL", "https://raw.githubusercontent.com/snap-research/locomo/refs/heads/main/data/locomo10.json")
@@ -121,6 +135,14 @@ class ExperimentRequest(BaseModel):
     # pre-leg reset is already resume-aware, so the load is paid once
     # and reused thereafter — useful for fast iteration on retrieval.
     skip_post_reset: bool = False
+    # Explicit session_id to resume INTO. When provided, the bench keys
+    # resume on this session_id instead of auto-generating a fresh one,
+    # so a re-run with the same id continues the existing run (skipping
+    # rows already present for that session_id) and a re-run without it
+    # — or with a different id — starts clean. When None (default), a
+    # new run_id is generated per /experiment call: every run is its
+    # own session, prior CSV rows from other sessions are not skipped.
+    session_id: str | None = None
 
     @field_validator("mode")
     @classmethod
@@ -143,14 +165,22 @@ class ExperimentRequest(BaseModel):
 # ---------------------------- helpers -----------------------------------
 
 def _toxics_for(mode: str) -> tuple[float, float, float]:
+    # `mode` is constrained by ExperimentRequest's validator, so the
+    # branches are exhaustive — no silent (0,0,0) fallback for unexpected
+    # values, which would otherwise mask validator regressions.
     if mode == "constrained":
         return CONSTRAINED_LATENCY, CONSTRAINED_JITTER, CONSTRAINED_BANDWIDTH
-    return 0.0, 0.0, 0.0
+    if mode == "unconstrained":
+        return 0.0, 0.0, 0.0
+    raise ValueError(f"unexpected mode {mode!r}")
 
 
 def _session_date_for_question(conv, evidence: list | None) -> str:
-    """Resolve evidence like ['D1:3'] to the session's date string so the
-    judge can anchor relative time references ('yesterday', 'last week')."""
+    """Resolve evidence like ['D1:3'] to the session's date string. The
+    responder uses this as its conversation-date anchor so it emits
+    absolute dates instead of relative references ("yesterday", "last
+    week"); the judge no longer needs an anchor since responder output
+    should already be in absolute form."""
     if not evidence or conv is None:
         return ""
     sds = getattr(conv, "session_datetimes", None) or {}
@@ -200,6 +230,7 @@ async def _do_warmup(
     latency: float,
     jitter: float,
     bandwidth: float,
+    session_id: str,
     name_prefix: str = "",
 ):
     """Pay backend one-time init (graphiti indices, qdrant collections)
@@ -210,11 +241,21 @@ async def _do_warmup(
     snap_t0 = await cgroup_snapshot(client)
     err: str | None = None
     detail: dict[str, Any] = {}
-    try:
-        detail = await post_warmup(client, backend, conv_idx)
-    except Exception as exc:
-        err = str(exc)[:300]
-        log.exception("[warmup] post failed")
+    with _tracer.start_as_current_span(
+        "warmup",
+        context=OTelContext(),
+        attributes={
+            "langfuse.session.id": session_id,
+            "langfuse.tags": f"service:benchmark,memory:{backend},conv:{conv_idx},mode:{mode}",
+            "dmas.backend": backend, "dmas.conv_index": conv_idx,
+        },
+    ) as warmup_span:
+        trace_id = format_trace_id(warmup_span.get_span_context().trace_id)
+        try:
+            detail = await post_warmup(client, backend, conv_idx)
+        except Exception as exc:
+            err = str(exc)[:300]
+            log.exception("[warmup] post failed")
 
     t_call_end = time.monotonic()
     snap_t1 = await cgroup_wait_io_quiet(client)
@@ -225,18 +266,23 @@ async def _do_warmup(
     mdelta = cgroup_delta(snap_t0, snap_t1)
 
     row: dict[str, Any] = {
+        "session_id": session_id,
+        "trace_id": trace_id,
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
         "experiment_name": _experiment_name(backend, conv_idx, mode, name_prefix),
         "phase": "warmup",
         "memory": backend,
+        "mode": mode,
         "conversation_index": conv_idx,
+        # `name_prefix` is consumed by results._file_for_row for filename
+        # routing; DictWriter drops it because it isn't in COLUMNS.
         "name_prefix": name_prefix,
         "seed": None,
         "question": None,
         "answer": (json.dumps(detail) if detail else None),
         "gold_answer": None,
-        "category": None,
-        "judge": None,
+        "question_category": None,
+        "judge_verdict": None,
         "judge_reason": None,
         "toxic_latency": latency, "toxic_jitter": jitter, "toxic_bandwidth": bandwidth,
         "wall_ms": wall_ms,
@@ -266,6 +312,7 @@ async def _do_load(
     jitter: float,
     bandwidth: float,
     skip_messages: set[str],
+    session_id: str,
     load_limit: int | None = None,
     name_prefix: str = "",
 ):
@@ -305,7 +352,41 @@ async def _do_load(
         "messages_loaded": 0, "messages_skipped": 0,
     }
 
-    for ord_idx, (sk, mi, turn) in enumerate(msgs, start=1):
+    # `langfuse.session.id` is set on every load.message + ask.question
+    # span and groups all traces from this run's leg into one Langfuse
+    # session. session_id is `{experiment_name}_{run_id}` — the run_id
+    # suffix is generated per /experiment call so re-runs of the same
+    # config land in distinct sessions instead of stacking up in one.
+    # Single parent `load` span so the operator sees one collapsible
+    # entry in the session view instead of N per-message session-roots.
+    # Each `load.message` below nests under it via the active context.
+    # `load_summaries` accumulates one entry per persisted message so
+    # the parent span can surface the full list as its `output` —
+    # mirroring how `responder.respond` exposes every search call. Lets
+    # the operator open the load span in Langfuse and inspect every
+    # message that was saved, instead of seeing an empty I/O panel.
+    load_summaries: list[dict[str, Any]] = []
+    load_input = {
+        "backend": backend,
+        "conv_index": conv_idx,
+        "mode": mode,
+        "speakers": [conv.speaker_a, conv.speaker_b],
+        "sessions": len(keys),
+        "messages_total": len(msgs),
+        "messages_already_loaded": len(skip_messages),
+    }
+    with _tracer.start_as_current_span(
+        "load",
+        context=OTelContext(),
+        attributes={
+            "langfuse.session.id": session_id,
+            "langfuse.tags": f"service:benchmark,memory:{backend},conv:{conv_idx},mode:{mode}",
+            "dmas.backend": backend, "dmas.conv_index": conv_idx,
+            "dmas.total_msgs": len(msgs),
+            "input": json.dumps(load_input)[:8000],
+        },
+    ) as load_sp:
+      for ord_idx, (sk, mi, turn) in enumerate(msgs, start=1):
         marker = str(ord_idx)
         session_int = int(sk[len("session_"):])
         # Visible progress for tmux: "[load] mem0 23/419 ..."
@@ -318,130 +399,201 @@ async def _do_load(
                    "session": session_int, "msg_idx": mi}
             continue
 
-        dt_key = f"{sk}_date_time"
-        session_dt = conv.session_datetimes.get(dt_key, "")
-        data = {
-            "speaker_a": conv.speaker_a,
-            "speaker_b": conv.speaker_b,
-            "sessions": {sk: [turn.dict()]},
-            "session_datetimes": ({dt_key: session_dt} if session_dt else {}),
-        }
+        # `load.message` nests under the parent `load` span (active in
+        # the current context), which keeps every per-message save under
+        # one collapsible session entry. Auto-instrumented httpx then
+        # opens its `POST /coordinator/memorize` client span as our
+        # child, which in turn nests the coordinator's manual
+        # `coordinator->memory.memorize` span and the memory-side
+        # `memory.persist` + gen_ai children.
+        with _tracer.start_as_current_span(
+            "load.message",
+            attributes={
+                "langfuse.session.id": session_id,
+                "langfuse.tags": f"service:benchmark,memory:{backend},conv:{conv_idx},mode:{mode}",
+                "dmas.backend": backend, "dmas.conv_index": conv_idx,
+                "dmas.session": session_int, "dmas.msg_idx": mi,
+                "dmas.ord_idx": ord_idx, "dmas.total_msgs": len(msgs),
+            },
+        ) as msg_span:
+            msg_trace_id = format_trace_id(msg_span.get_span_context().trace_id)
+            dt_key = f"{sk}_date_time"
+            session_dt = conv.session_datetimes.get(dt_key, "")
+            data = {
+                "speaker_a": conv.speaker_a,
+                "speaker_b": conv.speaker_b,
+                "sessions": {sk: [turn.dict()]},
+                "session_datetimes": ({dt_key: session_dt} if session_dt else {}),
+            }
+            msg_span.set_attribute("input", json.dumps(data)[:8000])
 
-        # cgroup counters are read straight from /sys/fs/cgroup pseudo-
-        # files — kernel-maintained, every read is the value at the
-        # moment of access. No telegraf scrape interval, no docker daemon
-        # stats cache, so a snapshot before+after a sub-second call
-        # returns the actual delta with no rounding.
-        t_call_start = time.monotonic()
-        snap_t0 = await cgroup_snapshot(client)
-        err: str | None = None
-        confirmation: dict[str, Any] = {}
-        try:
-            confirmation = await post_memorize(client, backend, conv_idx, data)
-        except Exception as exc:
-            err = str(exc)[:300]
-            log.exception("[load] post failed")
+            # cgroup counters are read straight from /sys/fs/cgroup pseudo-
+            # files — kernel-maintained, every read is the value at the
+            # moment of access. No telegraf scrape interval, no docker daemon
+            # stats cache, so a snapshot before+after a sub-second call
+            # returns the actual delta with no rounding.
+            t_call_start = time.monotonic()
+            snap_t0 = await cgroup_snapshot(client)
+            err: str | None = None
+            confirmation: dict[str, Any] = {}
+            try:
+                confirmation = await post_memorize(client, backend, conv_idx, data,
+                                                   session_id=session_id, mode=mode)
+            except Exception as exc:
+                err = str(exc)[:300]
+                log.exception("[load] post failed")
 
-        t_call_end = time.monotonic()
-        # Block until cloud-side disk activity quiesces so async DB
-        # checkpoints (Neo4j) land in this row's t1 snapshot. Track the
-        # extra wait separately as flush_ms so wall_ms can be split into
-        # the production-equivalent compute_ms and the artificial flush.
-        snap_t1 = await cgroup_wait_io_quiet(client)
-        t_after_flush = time.monotonic()
-        compute_ms = (t_call_end - t_call_start) * 1000.0
-        flush_ms = (t_after_flush - t_call_end) * 1000.0
-        wall_ms = compute_ms + flush_ms
-        mdelta = cgroup_delta(snap_t0, snap_t1)
+            t_call_end = time.monotonic()
+            # Block until cloud-side disk activity quiesces so async DB
+            # checkpoints (Neo4j) land in this row's t1 snapshot. Track the
+            # extra wait separately as flush_ms so wall_ms can be split into
+            # the production-equivalent compute_ms and the artificial flush.
+            snap_t1 = await cgroup_wait_io_quiet(client)
+            t_after_flush = time.monotonic()
+            compute_ms = (t_call_end - t_call_start) * 1000.0
+            flush_ms = (t_after_flush - t_call_end) * 1000.0
+            wall_ms = compute_ms + flush_ms
+            mdelta = cgroup_delta(snap_t0, snap_t1)
 
-        # The memory service returns a `memories` list — for a single-turn
-        # payload that's [single_event] (or [] on validation error / 0 on
-        # blank turn). Take the first event if any; otherwise synthesise.
-        memories_in_resp = list(confirmation.get("memories") or [])
-        m_evt = memories_in_resp[0] if memories_in_resp else {
-            "session": sk, "chunk_idx": mi,
-            "status": "failed" if err else "skipped",
-            "preview": "", "error": err,
-            "edge_tokens": 0, "edge_cost": 0.0,
-            "cloud_tokens": 0, "cloud_cost": 0.0,
-        }
-        status = m_evt.get("status") or ("failed" if err else "ok")
-        # Per-message LLM tokens/cost split by deployment, sourced from
-        # litellm's /metrics counter on the memory side. edge_llm_* is
-        # ollama-served (free), cloud_llm_* is OpenAI passthrough.
-        edge_llm_tokens = int(m_evt.get("edge_tokens") or 0)
-        edge_llm_cost = float(m_evt.get("edge_cost") or 0.0)
-        cloud_llm_tokens = int(m_evt.get("cloud_tokens") or 0)
-        cloud_llm_cost = float(m_evt.get("cloud_cost") or 0.0)
-        llm_tokens = edge_llm_tokens + cloud_llm_tokens
-        llm_cost = edge_llm_cost + cloud_llm_cost
+            # The memory service returns a `memories` list — for a single-turn
+            # payload that's [single_event] (or [] on validation error / 0 on
+            # blank turn). Take the first event if any; otherwise synthesise.
+            memories_in_resp = list(confirmation.get("memories") or [])
+            m_evt = memories_in_resp[0] if memories_in_resp else {
+                "session": sk, "chunk_idx": mi,
+                "status": "failed" if err else "skipped",
+                "preview": "", "error": err,
+                "edge_tokens": 0, "edge_cost": 0.0,
+                "cloud_tokens": 0, "cloud_cost": 0.0,
+            }
+            status = m_evt.get("status") or ("failed" if err else "ok")
+            # Per-message LLM tokens/cost split by deployment, sourced from
+            # litellm's /metrics counter on the memory side. edge_llm_* is
+            # ollama-served (free), cloud_llm_* is OpenAI passthrough.
+            edge_llm_tokens = int(m_evt.get("edge_tokens") or 0)
+            edge_llm_cost = float(m_evt.get("edge_cost") or 0.0)
+            cloud_llm_tokens = int(m_evt.get("cloud_tokens") or 0)
+            cloud_llm_cost = float(m_evt.get("cloud_cost") or 0.0)
+            llm_tokens = edge_llm_tokens + cloud_llm_tokens
+            llm_cost = edge_llm_cost + cloud_llm_cost
 
-        row: dict[str, Any] = {
-            "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "experiment_name": _experiment_name(backend, conv_idx, mode, name_prefix),
-            "phase": "load",
-            "memory": backend,
-            "conversation_index": conv_idx,
-            "name_prefix": name_prefix,
-            # seed carries the session number for load rows — keeps
-            # `category` reserved for the LoCoMo question type used by
-            # ask rows so the notebook's category→question_type mapping
-            # never sees session ordinals.
-            "seed": session_int,
-            "question": marker,
-            "answer": (m_evt.get("preview") or None),
-            "gold_answer": None,
-            "category": None,
-            "judge": None,
-            "judge_reason": None,
-            "toxic_latency": latency, "toxic_jitter": jitter, "toxic_bandwidth": bandwidth,
-            "wall_ms": wall_ms,
-            "compute_ms": compute_ms,
-            "flush_ms": flush_ms,
-            **mdelta,
-            "edge_llm_tokens": edge_llm_tokens,
-            "edge_llm_cost_usd": edge_llm_cost,
-            "cloud_llm_tokens": cloud_llm_tokens,
-            "cloud_llm_cost_usd": cloud_llm_cost,
-            "llm_tokens": llm_tokens,
-            "llm_cost_usd": llm_cost,
-            "error": err or m_evt.get("error"),
-        }
-        append_row(row)
+            row: dict[str, Any] = {
+                "session_id": session_id,
+                "trace_id": msg_trace_id,
+                "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "experiment_name": _experiment_name(backend, conv_idx, mode, name_prefix),
+                "phase": "load",
+                "memory": backend,
+                "mode": mode,
+                "conversation_index": conv_idx,
+                "name_prefix": name_prefix,
+                # seed carries the session number for load rows — keeps
+                # `question_category` reserved for the LoCoMo question type
+                # used by ask rows so the notebook's category→question_type
+                # mapping never sees session ordinals.
+                "seed": session_int,
+                "question": marker,
+                "answer": (m_evt.get("preview") or None),
+                "gold_answer": None,
+                "question_category": None,
+                "judge_verdict": None,
+                "judge_reason": None,
+                "toxic_latency": latency, "toxic_jitter": jitter, "toxic_bandwidth": bandwidth,
+                "wall_ms": wall_ms,
+                "compute_ms": compute_ms,
+                "flush_ms": flush_ms,
+                **mdelta,
+                "edge_llm_tokens": edge_llm_tokens,
+                "edge_llm_cost_usd": edge_llm_cost,
+                "cloud_llm_tokens": cloud_llm_tokens,
+                "cloud_llm_cost_usd": cloud_llm_cost,
+                "llm_tokens": llm_tokens,
+                "llm_cost_usd": llm_cost,
+                "error": err or m_evt.get("error"),
+            }
+            append_row(row)
 
-        log.info("[load] %s %d/%d session=%d %s wall=%.2fs edge=%d/$%.4f cloud=%d/$%.4f",
-                 backend, ord_idx, len(msgs), session_int,
-                 status.upper(), wall_ms / 1000,
-                 edge_llm_tokens, edge_llm_cost, cloud_llm_tokens, cloud_llm_cost)
-        yield {"_phase": "memory_added", "backend": backend, "conv": conv_idx,
-               "mode": mode, "session": session_int, "msg_idx": mi,
-               "msg_counter": ord_idx, "total": len(msgs),
-               "status": status,
-               "wall_ms": wall_ms,
-               "edge_llm_tokens": edge_llm_tokens, "edge_llm_cost_usd": edge_llm_cost,
-               "cloud_llm_tokens": cloud_llm_tokens, "cloud_llm_cost_usd": cloud_llm_cost,
-               "llm_tokens": llm_tokens, "llm_cost_usd": llm_cost}
+            msg_span.set_attribute("dmas.status", status)
+            msg_span.set_attribute("dmas.wall_ms", wall_ms)
+            msg_span.set_attribute("dmas.compute_ms", compute_ms)
+            msg_span.set_attribute("dmas.flush_ms", flush_ms)
+            msg_span.set_attribute("dmas.llm_tokens", llm_tokens)
+            msg_span.set_attribute("dmas.llm_cost_usd", llm_cost)
+            msg_span.set_attribute(
+                "output",
+                json.dumps({
+                    "status": status, "wall_ms": wall_ms,
+                    "preview": (m_evt.get("preview") or "")[:500],
+                    "llm_tokens": llm_tokens, "llm_cost_usd": llm_cost,
+                })[:8000],
+            )
+            # Append a per-message entry to the parent `load` span's
+            # output payload so the session view exposes the full list
+            # of saved messages on the parent span (collapsible JSON in
+            # Langfuse), same pattern as `responder.respond`.
+            load_summaries.append({
+                "ord": ord_idx,
+                "session": session_int,
+                "msg_idx": mi,
+                "status": status,
+                "wall_ms": wall_ms,
+                "preview": (m_evt.get("preview") or "")[:300],
+                "llm_tokens": llm_tokens,
+            })
 
-        if err:
-            raise HTTPException(502, f"memorize {marker} failed: {err}")
+            log.info("[load] %s %d/%d session=%d %s wall=%.2fs edge=%d/$%.4f cloud=%d/$%.4f",
+                     backend, ord_idx, len(msgs), session_int,
+                     status.upper(), wall_ms / 1000,
+                     edge_llm_tokens, edge_llm_cost, cloud_llm_tokens, cloud_llm_cost)
+            yield {"_phase": "memory_added", "backend": backend, "conv": conv_idx,
+                   "mode": mode, "session": session_int, "msg_idx": mi,
+                   "msg_counter": ord_idx, "total": len(msgs),
+                   "status": status,
+                   "wall_ms": wall_ms,
+                   "edge_llm_tokens": edge_llm_tokens, "edge_llm_cost_usd": edge_llm_cost,
+                   "cloud_llm_tokens": cloud_llm_tokens, "cloud_llm_cost_usd": cloud_llm_cost,
+                   "llm_tokens": llm_tokens, "llm_cost_usd": llm_cost}
 
-        if status == "ok":
-            totals["added"] += 1
-            totals["messages_loaded"] += 1
-        elif status == "skipped":
-            totals["messages_skipped"] += 1
-        else:
-            totals["failed"] += 1
-        totals["wall_ms"] += wall_ms
-        totals["edge_llm_tokens"] += edge_llm_tokens
-        totals["edge_llm_cost_usd"] += edge_llm_cost
-        totals["cloud_llm_tokens"] += cloud_llm_tokens
-        totals["cloud_llm_cost_usd"] += cloud_llm_cost
-        totals["llm_tokens"] += llm_tokens
-        totals["llm_cost_usd"] += llm_cost
+            if err:
+                raise HTTPException(502, f"memorize {marker} failed: {err}")
+
+            if status == "ok":
+                totals["added"] += 1
+                totals["messages_loaded"] += 1
+            elif status == "skipped":
+                totals["messages_skipped"] += 1
+            else:
+                totals["failed"] += 1
+            totals["wall_ms"] += wall_ms
+            totals["edge_llm_tokens"] += edge_llm_tokens
+            totals["edge_llm_cost_usd"] += edge_llm_cost
+            totals["cloud_llm_tokens"] += cloud_llm_tokens
+            totals["cloud_llm_cost_usd"] += cloud_llm_cost
+            totals["llm_tokens"] += llm_tokens
+            totals["llm_cost_usd"] += llm_cost
+      try:
+          load_sp.set_attribute("dmas.messages_loaded", totals["messages_loaded"])
+          load_sp.set_attribute("dmas.messages_skipped", totals["messages_skipped"])
+          load_sp.set_attribute("dmas.messages_failed", totals["failed"])
+          load_sp.set_attribute("dmas.wall_ms", totals["wall_ms"])
+          load_sp.set_attribute(
+              "output",
+              json.dumps({
+                  "messages_total": len(msgs),
+                  "messages_loaded": totals["messages_loaded"],
+                  "messages_skipped": totals["messages_skipped"],
+                  "messages_failed": totals["failed"],
+                  "wall_ms": totals["wall_ms"],
+                  "llm_tokens": totals["llm_tokens"],
+                  "llm_cost_usd": totals["llm_cost_usd"],
+                  "messages": load_summaries,
+              })[:64000],
+          )
+      except Exception:
+          pass
 
     yield {"_phase": "load_done", "backend": backend, "conv": conv_idx, "mode": mode,
-           "messages_total": len(msgs), **totals}
+           "messages_total": len(msgs), "session_id": session_id, **totals}
 
 
 @app.post("/experiment")
@@ -474,15 +626,35 @@ async def experiment(req: ExperimentRequest, request: Request):
     if req.limit is not None and req.limit > 0:
         questions = questions[: req.limit]
 
+    # One run_id per /experiment call. Suffixed onto every leg's
+    # session_id so re-running the same (backend, conv, mode, prefix)
+    # gets a fresh Langfuse session instead of stacking traces under
+    # the previous run's session. 8 hex chars ≈ 4 billion combinations,
+    # plenty for human-distinguishable URLs.
+    # If the operator passes `session_id` on the request, we use it
+    # verbatim and derive a stable run_id from its suffix so later legs
+    # in the same call still group together.
+    run_id = (req.session_id.rsplit("_", 1)[-1]
+              if req.session_id else uuid.uuid4().hex[:8])
     log.info(
-        "/experiment conv=%d mode=%s backends=%s judge_n=%d questions=%d toxics=lat%s/jit%s/bw%s",
-        req.conv, req.mode, req.backends, req.llm_as_judge_seed, len(questions), latency, jitter, bandwidth,
+        "/experiment conv=%d mode=%s backends=%s judge_n=%d questions=%d toxics=lat%s/jit%s/bw%s run_id=%s",
+        req.conv, req.mode, req.backends, req.llm_as_judge_seed, len(questions), latency, jitter, bandwidth, run_id,
     )
 
     async def gen():
         for backend in req.backends:
+            exp_name = _experiment_name(backend, req.conv, req.mode, req.name_prefix)
+            # Use the operator-supplied session_id verbatim only when it
+            # matches THIS leg's exp_name; otherwise rebuild from
+            # exp_name + run_id so each (backend, conv, mode) leg in a
+            # multi-leg call still gets its own distinct session.
+            if req.session_id and req.session_id.startswith(exp_name + "_"):
+                session_id = req.session_id
+            else:
+                session_id = f"{exp_name}_{run_id}"
             yield json.dumps({"_phase": "backend_start", "backend": backend,
-                              "mode": req.mode, "conv": req.conv}) + "\n"
+                              "mode": req.mode, "conv": req.conv,
+                              "session_id": session_id}) + "\n"
 
             # Apply toxics first so the proxies exist before reset routes through them.
             try:
@@ -496,7 +668,8 @@ async def experiment(req: ExperimentRequest, request: Request):
             # been saved yet for this (backend, conv, mode). On a partial
             # resume, the storage on disk is the source of truth — wiping
             # would discard the work the existing CSV rows attest to.
-            done_msgs = loaded_messages(backend, req.conv, latency, jitter, bandwidth, req.name_prefix)
+            done_msgs = loaded_messages(backend, req.conv, latency, jitter, bandwidth,
+                                        req.name_prefix, session_id=session_id)
             if not done_msgs:
                 try:
                     pre = await post_reset(client, backend)
@@ -513,6 +686,7 @@ async def experiment(req: ExperimentRequest, request: Request):
                 try:
                     async for evt in _do_warmup(client, backend, req.conv, req.mode,
                                                 latency, jitter, bandwidth,
+                                                session_id,
                                                 name_prefix=req.name_prefix):
                         yield json.dumps(evt) + "\n"
                 except Exception as exc:
@@ -527,6 +701,7 @@ async def experiment(req: ExperimentRequest, request: Request):
             try:
                 async for evt in _do_load(client, backend, req.conv, req.mode,
                                           latency, jitter, bandwidth, done_msgs,
+                                          session_id,
                                           load_limit=req.load_limit,
                                           name_prefix=req.name_prefix):
                     yield json.dumps(evt) + "\n"
@@ -537,9 +712,9 @@ async def experiment(req: ExperimentRequest, request: Request):
 
             # Ask. Each question is asked ONCE; only the LLM-as-judge
             # repeats `req.llm_as_judge_seed` times and majority-votes.
-            skip = already_done(backend, req.conv, latency, jitter, bandwidth, req.name_prefix)
+            skip = already_done(backend, req.conv, latency, jitter, bandwidth,
+                                req.name_prefix, session_id=session_id)
             conv_obj = storage.get_conversation_by_index(req.conv)
-            exp_name = _experiment_name(backend, req.conv, req.mode, req.name_prefix)
             n_emitted = n_skipped = 0
             for i, q in enumerate(questions, start=1):
                 qtext = q["question"]
@@ -552,41 +727,74 @@ async def experiment(req: ExperimentRequest, request: Request):
                 await verify_all(client, TOXIPROXY_ADMINS, latency, jitter, bandwidth)
                 log.info("[exp] %s %d/%d ASK | %s",
                          backend, i, len(questions), qtext[:200].replace("\n", " "))
+                # Resolve the conversation date for this question's evidence
+                # BEFORE asking so we can pass it to the responder as the
+                # anchor for relative time references ("yesterday", "last
+                # week").
+                session_date = _session_date_for_question(conv_obj, q.get("evidence"))
                 t_call_start = time.monotonic()
                 snap_t0 = await cgroup_snapshot(client)
                 usage_t0 = await litellm_usage_snapshot(client)
 
                 answer = ""
                 err: str | None = None
-                coordinator_asked_responder: bool | None = None
                 memories_returned: int | None = None
                 top_k_seen: int | None = None
                 search_calls: int | None = None
-                responder_context_tokens: int | None = None
-                try:
-                    resp = await post_ask(client, qtext, backend)
-                    # Strip trailing whitespace — the responder/SLM
-                    # sometimes emits a trailing newline that breaks
-                    # CSV viewers even though it's properly quoted.
-                    answer = (resp.get("answer", "") or "").strip()
-                    if resp.get("status") == "error":
-                        err = resp.get("error")
-                    # Retrieval stats threaded up from
-                    # coordinator → responder → memory. Optional;
-                    # legacy responses that don't carry them leave
-                    # the columns blank.
-                    if "coordinator_asked_responder" in resp:
-                        coordinator_asked_responder = bool(resp["coordinator_asked_responder"])
-                    if "memories_returned" in resp:
-                        memories_returned = int(resp["memories_returned"] or 0)
-                    if "top_k" in resp and resp["top_k"] is not None:
-                        top_k_seen = int(resp["top_k"])
-                    if "search_calls" in resp:
-                        search_calls = int(resp["search_calls"] or 0)
-                    if resp.get("responder_context_tokens") is not None:
-                        responder_context_tokens = int(resp["responder_context_tokens"])
-                except Exception as exc:
-                    err = str(exc)[:300]
+                responder_context_window_tokens: int | None = None
+                responder_context_window_cost_usd: float | None = None
+                # Detached root span: each ask.question gets its own
+                # trace_id; langfuse.session.id ties it to the same
+                # session as the load.message traces above.
+                with _tracer.start_as_current_span(
+                    "ask.question",
+                    context=OTelContext(),
+                    attributes={
+                        "langfuse.session.id": session_id,
+                        "langfuse.tags": f"service:benchmark,memory:{backend},conv:{req.conv},mode:{req.mode}",
+                        "input": qtext[:8000],
+                        "dmas.backend": backend, "dmas.conv_index": req.conv,
+                        "dmas.mode": req.mode, "dmas.question_idx": i,
+                    },
+                ) as ask_span:
+                    ask_trace_id = format_trace_id(ask_span.get_span_context().trace_id)
+                    try:
+                        resp = await post_ask(client, qtext, backend, session_date,
+                                              session_id=session_id,
+                                              conv_index=req.conv, mode=req.mode)
+                        # Strip trailing whitespace — the responder/SLM
+                        # sometimes emits a trailing newline that breaks
+                        # CSV viewers even though it's properly quoted.
+                        answer = (resp.get("answer", "") or "").strip()
+                        if resp.get("status") == "error":
+                            err = resp.get("error")
+                        # Retrieval stats threaded up from
+                        # coordinator → responder → memory. Optional;
+                        # legacy responses that don't carry them leave
+                        # the columns blank.
+                        if "memories_returned" in resp:
+                            memories_returned = int(resp["memories_returned"] or 0)
+                        if "top_k" in resp and resp["top_k"] is not None:
+                            top_k_seen = int(resp["top_k"])
+                        if "search_calls" in resp:
+                            search_calls = int(resp["search_calls"] or 0)
+                        if resp.get("responder_context_window_tokens") is not None:
+                            responder_context_window_tokens = int(resp["responder_context_window_tokens"])
+                        if resp.get("responder_context_window_cost_usd") is not None:
+                            responder_context_window_cost_usd = float(resp["responder_context_window_cost_usd"])
+                    except Exception as exc:
+                        err = str(exc)[:300]
+                        # Mark the span as errored so Langfuse renders it
+                        # with the failure icon. record_exception attaches
+                        # the traceback as a span event for full context.
+                        ask_span.record_exception(exc)
+                        ask_span.set_status(otel_trace.Status(otel_trace.StatusCode.ERROR, err))
+                    try:
+                        ask_span.set_attribute("output", (answer or "")[:8000])
+                        if err:
+                            ask_span.set_attribute("dmas.error", err)
+                    except Exception:
+                        pass
 
                 t_call_end = time.monotonic()
                 snap_t1 = await cgroup_wait_io_quiet(client)
@@ -605,29 +813,61 @@ async def experiment(req: ExperimentRequest, request: Request):
                 llm_cost = edge_llm_cost + cloud_llm_cost
 
                 gold = q.get("answer")
+                judge_trace_id: str | None = None
                 if err:
                     j_label = None
                     j_reason = None
                     j_n = 0
                     j_correct = 0
-                    j_labels_str: str | None = None
                 else:
-                    session_date = _session_date_for_question(conv_obj, q.get("evidence"))
-                    j = await asyncio.to_thread(
-                        judge_majority, qtext, gold, answer, session_date,
-                        req.llm_as_judge_seed,
-                    )
+                    # Detached root: each judge.evaluate is its own trace
+                    # under the same session as ask.question + the load
+                    # legs. `contextvars.copy_context().run` propagates
+                    # the OTel current span into the worker thread so
+                    # the N parallel `gpt-4o-mini` judge calls nest
+                    # under judge.evaluate instead of forming orphan
+                    # gen_ai traces.
+                    with _tracer.start_as_current_span(
+                        "judge.evaluate",
+                        context=OTelContext(),
+                        attributes={
+                            "langfuse.session.id": session_id,
+                            "langfuse.tags": f"service:judge,memory:{backend},conv:{req.conv},mode:{req.mode}",
+                            "input": json.dumps({
+                                "question": qtext, "gold": gold, "answer": answer,
+                            })[:8000],
+                            "dmas.judge_n": req.llm_as_judge_seed,
+                        },
+                    ) as judge_span:
+                        judge_trace_id = format_trace_id(judge_span.get_span_context().trace_id)
+                        ctx = contextvars.copy_context()
+                        j = await asyncio.to_thread(
+                            ctx.run, judge_majority,
+                            qtext, gold, answer, req.llm_as_judge_seed,
+                        )
+                        try:
+                            judge_span.set_attribute("output", json.dumps({
+                                "verdict": j.label,
+                                "correct_votes": j.correct_votes,
+                                "n": j.n,
+                                "reason": (j.reasonings[0] if j.reasonings else "")[:2000],
+                            })[:8000])
+                        except Exception:
+                            pass
                     j_label = j.label
                     j_reason = (j.reasonings[0] if j.reasonings else "").strip()
                     j_n = j.n
                     j_correct = j.correct_votes
-                    j_labels_str = "|".join(j.votes) if j.votes else None
 
                 row: dict[str, Any] = {
+                    "session_id": session_id,
+                    "trace_id": ask_trace_id,
+                    "judge_trace_id": judge_trace_id,
                     "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
                     "experiment_name": exp_name,
                     "phase": "ask",
                     "memory": backend,
+                    "mode": req.mode,
                     "conversation_index": req.conv,
                     "name_prefix": req.name_prefix,
                     # `seed` only carries meaning on load rows (session
@@ -637,8 +877,9 @@ async def experiment(req: ExperimentRequest, request: Request):
                     "question": qtext,
                     "answer": answer,
                     "gold_answer": gold,
-                    "category": q.get("category"),
-                    "judge": j_label,
+                    "question_category": q.get("category"),
+                    "judge_n": j_n,
+                    "judge_verdict": j_label,
                     "judge_reason": j_reason,
                     "toxic_latency": latency,
                     "toxic_jitter": jitter,
@@ -653,14 +894,11 @@ async def experiment(req: ExperimentRequest, request: Request):
                     "cloud_llm_cost_usd": cloud_llm_cost,
                     "llm_tokens": llm_tokens,
                     "llm_cost_usd": llm_cost,
-                    "coordinator_asked_responder": coordinator_asked_responder,
                     "memories_returned": memories_returned,
                     "top_k": top_k_seen,
                     "search_calls": search_calls,
-                    "responder_context_tokens": responder_context_tokens,
-                    "judge_n": j_n,
-                    "judge_correct_votes": j_correct,
-                    "judge_labels": j_labels_str,
+                    "responder_context_window_tokens": responder_context_window_tokens,
+                    "responder_context_window_cost_usd": responder_context_window_cost_usd,
                     "error": err,
                 }
                 append_row(row)

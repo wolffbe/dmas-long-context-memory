@@ -1,10 +1,14 @@
-"""Direct read of litellm's `/metrics` endpoint, split by deployment.
+"""Direct read of litellm's `/metrics` Prometheus exposition endpoint.
 
-Mirrors the memory service's helper. Returns counter values at the
-moment of the GET, classifying each line into edge (ollama-served, by
-default the model named in $OLLAMA_MODEL) or cloud (everything else,
-i.e. OpenAI passthrough). Two snapshots before+after a call attribute
-true per-call tokens and cost without scrape rounding.
+Returns counter values at the moment of the GET — no scrape lag, no
+TSDB rounding. Two snapshots before+after a single LLM call attribute
+true per-call tokens and cost.
+
+Output is split by *deployment group*: edge (local, ollama-served) vs
+cloud (OpenAI-served). Classification is by `model` label on each
+litellm metric line, matched against the comma-separated set in
+EDGE_MODELS env (defaults to OLLAMA_MODEL — the local model). Anything
+else is cloud.
 """
 from __future__ import annotations
 
@@ -40,19 +44,9 @@ _LINE = re.compile(
 _LABEL = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
 
 
-async def usage_snapshot(client: httpx.AsyncClient) -> dict[str, float]:
-    """Return per-group totals at the current instant.
-
-    Keys: `edge_tokens`, `edge_cost`, `cloud_tokens`, `cloud_cost`.
-    """
+def _parse(text: str) -> dict[str, float]:
     out = {"edge_tokens": 0.0, "edge_cost": 0.0,
            "cloud_tokens": 0.0, "cloud_cost": 0.0}
-    try:
-        r = await client.get(LITELLM_METRICS_URL, timeout=2.0, follow_redirects=True)
-        text = r.text
-    except Exception as exc:
-        logger.debug("litellm /metrics fetch failed: %s", exc)
-        return out
     edge_models = _edge_models()
     for m in _LINE.finditer(text):
         name = m.group(1)
@@ -70,6 +64,39 @@ async def usage_snapshot(client: httpx.AsyncClient) -> dict[str, float]:
     out["edge_tokens"] = int(out["edge_tokens"])
     out["cloud_tokens"] = int(out["cloud_tokens"])
     return out
+
+
+# Sync client for the memory service path. Lazy/module-level so the TCP
+# connection to litellm is reused across snapshots.
+_sync_client = httpx.Client(timeout=2.0, follow_redirects=True)
+
+
+def usage_snapshot_sync() -> dict[str, float]:
+    """Return per-group totals at the current instant (sync).
+
+    Failures degrade to all-zero so a flaky read never mis-attributes
+    a delta later.
+    """
+    try:
+        text = _sync_client.get(LITELLM_METRICS_URL).text
+    except Exception as exc:
+        logger.debug("litellm /metrics fetch failed: %s", exc)
+        return {"edge_tokens": 0.0, "edge_cost": 0.0,
+                "cloud_tokens": 0.0, "cloud_cost": 0.0}
+    return _parse(text)
+
+
+async def usage_snapshot_async(client: httpx.AsyncClient) -> dict[str, float]:
+    """Async equivalent of `usage_snapshot_sync`. Caller-supplied client
+    so connection pooling stays under the caller's control."""
+    try:
+        r = await client.get(LITELLM_METRICS_URL, timeout=2.0, follow_redirects=True)
+        text = r.text
+    except Exception as exc:
+        logger.debug("litellm /metrics fetch failed: %s", exc)
+        return {"edge_tokens": 0.0, "edge_cost": 0.0,
+                "cloud_tokens": 0.0, "cloud_cost": 0.0}
+    return _parse(text)
 
 
 def diff(t0: dict[str, float], t1: dict[str, float]) -> dict[str, float]:
