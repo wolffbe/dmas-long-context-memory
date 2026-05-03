@@ -1,0 +1,59 @@
+model_list:
+  # Local SLM via Ollama. We use `ollama_chat/` (NOT bare `ollama/`) so
+  # LiteLLM hits Ollama's /api/chat (OpenAI-compatible chat completions)
+  # rather than the legacy /api/generate. This guarantees a populated
+  # `choices[0].message.content` in the response, which is what the
+  # coordinator's tool-calling loop expects.
+  # The coordinator passes the bare model tag (`OLLAMA_MODEL` env)
+  # straight through, so the alias here matches the ollama tag —
+  # generations in langfuse render as `qwen2.5:3b-instruct-q4_K_M` etc.
+  # instead of an opaque `local-slm`. LiteLLM does not expand ${VAR} in
+  # model_name/model, so both must be literal — keep this in sync with
+  # OLLAMA_MODEL in .env / docker-compose.
+  - model_name: qwen2.5:3b-instruct-q4_K_M
+    litellm_params:
+      model: ollama_chat/qwen2.5:3b-instruct-q4_K_M
+      api_base: http://ollama:11434
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+
+  # The ONLY cloud chat/completion model in the system. Every backend
+  # (responder, judge, mem0/graphiti/cognee extractors, graphiti
+  # cross-encoder reranker) routes through this alias.
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+
+  # Embeddings (different model class — chat models can't produce
+  # embeddings). Used by mem0/graphiti/cognee/rag for vector retrieval.
+  - model_name: text-embedding-3-small
+    litellm_params:
+      model: openai/text-embedding-3-small
+      api_key: os.environ/OPENAI_API_KEY
+
+litellm_settings:
+  drop_params: true
+  # The "prometheus" callback is what makes litellm expose its
+  # /metrics endpoint with the litellm_total_tokens_metric_total +
+  # litellm_spend_metric_total counters. The bench reads /metrics
+  # directly (no Prometheus server), but this callback is still
+  # required to populate those counters. Don't remove.
+  # `otel` exports each completion as a `gen_ai.*` span via OTLP to
+  # langfuse-web v3 — endpoint + Basic-auth header come from
+  # OTEL_EXPORTER_OTLP_* env in docker-compose.yml. With W3C
+  # `traceparent` propagated by the OpenAI SDK's HTTP client, each
+  # gen_ai span nests under the caller's manual span (e.g.
+  # `memory.persist`) instead of forming a standalone trace.
+  success_callback: ["otel", "prometheus"]
+  failure_callback: ["otel", "prometheus"]
+  redact_user_api_key_info: true
+  # Survive a 24h 30min rate-limit window with a linear 60s floor between
+  # retries: 1470 attempts × 60s = 88 200s = 24h 30min. After that the call fails.
+  # LiteLLM honors upstream Retry-After when it's larger than retry_after.
+  num_retries: 1470
+  retry_after: 60
+  request_timeout: 600
+
+general_settings:
+  master_key: sk-litellm-master

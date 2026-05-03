@@ -5,13 +5,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY responder/requirements.txt .
+COPY benchmark/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY responder/main.py .
-COPY responder/app/ ./app/
+COPY benchmark/main.py .
+COPY benchmark/app/ ./app/
 COPY shared/ ./shared/
 
-EXPOSE 8006
+EXPOSE 8000
 
 CMD ["python", "main.py"]
