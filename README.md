@@ -2,6 +2,8 @@
 
 A distributed multi-agent system testbed for benchmarking five long-term conversational memory strategies under different network scenarios.
 
+![dmas](docs/dmas.png)
+
 ## Overview
 
 This project compares five approaches to persistent memory in LLM-based multi-agent systems:
