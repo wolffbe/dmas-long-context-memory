@@ -13,6 +13,7 @@ from mem0 import Memory
 from mem0.configs import prompts as _mem0_prompts
 from mem0.configs.base import MemoryConfig
 
+from shared.errors import exc_trace
 from shared.litellm_usage import usage_snapshot_sync as usage_snapshot, diff as usage_diff
 
 logger = logging.getLogger(__name__)
@@ -246,10 +247,11 @@ class Mem0Service:
                     du = usage_diff(u0, u1)
                     logger.exception("Ingestion failed: conv %d %s chunk %d", conv_index, session_key, chunk_idx)
                     failed += 1
+                    err_compact = exc_trace(exc)
                     failures.append({
                         "session": session_key,
                         "chunk_index": chunk_idx,
-                        "error": str(exc),
+                        "error": err_compact,
                     })
                     logger.info(
                         "[mem0 load] conv=%d %d/%d %s FAILED wall=%.2fs | %s",
@@ -258,7 +260,8 @@ class Mem0Service:
                     yield {
                         "event": "memory",
                         "session": session_key, "chunk_idx": chunk_idx,
-                        "status": "failed", "preview": preview, "error": str(exc)[:300],
+                        "status": "failed", "preview": preview,
+                        "error": err_compact[:300],
                         "wall_ms": m_wall_ms,
                         **du,
                     }

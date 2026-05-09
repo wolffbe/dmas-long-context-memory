@@ -25,6 +25,7 @@ from cognee.api.v1.search import SearchType
 # raises "Unsupported vector database provider: qdrant".
 import cognee_community_vector_adapter_qdrant.register  # noqa: F401
 
+from shared.errors import exc_trace
 from shared.litellm_usage import usage_snapshot_sync as usage_snapshot, diff as usage_diff
 from app.services.mem0_service import parse_locomo_date
 
@@ -250,15 +251,17 @@ class CogneeService:
                     logger.exception("Ingestion failed: conv %d %s msg %d",
                                      conv_index, session_key, msg_idx)
                     failed += 1
+                    err_compact = exc_trace(exc)
                     failures.append({
                         "session": session_key,
                         "chunk_index": msg_idx,
-                        "error": str(exc),
+                        "error": err_compact,
                     })
                     yield {
                         "event": "memory",
                         "session": session_key, "chunk_idx": msg_idx,
-                        "status": "failed", "preview": preview, "error": str(exc)[:300],
+                        "status": "failed", "preview": preview,
+                        "error": err_compact[:300],
                         "wall_ms": m_wall_ms,
                         **du,
                     }

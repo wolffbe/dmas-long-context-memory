@@ -31,14 +31,6 @@ CGROUP_ROOT = Path(os.getenv("CGROUP_ROOT", "/host-cgroup"))
 PROC_ROOT = Path(os.getenv("PROC_ROOT", "/host-proc"))
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 
-# Pure pass-through proxies whose tx is a re-transmit of bytes the
-# upstream container already counted. Including their tx in the group
-# total would double-count every transfer that traverses them. Comma-
-# separated container-name list; default skips toxiproxy.
-NETWORK_TX_EXCLUDE = {
-    n.strip() for n in os.getenv("NETWORK_TX_EXCLUDE", "toxiproxy").split(",") if n.strip()
-}
-
 # container_id -> {"group": "edge"|"cloud", "pid": str, "name": str}
 _label_cache: dict[str, dict[str, str]] = {}
 _docker_client: httpx.AsyncClient | None = None
@@ -131,8 +123,9 @@ def _read_net_tx(pid: str) -> int:
 
     We only count tx (not rx) so a transfer A→B isn't counted twice
     (once as A.tx, once as B.rx). Each byte is attributed to its
-    sender. Toxiproxy hops still count once per leg, which correctly
-    reflects bandwidth actually used.
+    sender. Pass-through relays (toxiproxy, litellm) are unlabelled and
+    therefore skipped entirely, so a relayed payload is counted once at
+    its true originator rather than at every hop.
     """
     if not pid or pid == "0":
         return 0
@@ -189,12 +182,9 @@ async def snapshot(_unused_client: httpx.AsyncClient | None = None) -> dict[str,
         sums[f"ram_{group}_peak"] += mem_peak
         sums[f"disk_{group}_read"] += rb
         sums[f"disk_{group}_write"] += wb
-        # Network: tx-only across both groups so each byte is counted
-        # once at its sender. Containers in NETWORK_TX_EXCLUDE
-        # (toxiproxy) are skipped because they retransmit upstream
-        # bytes verbatim, which would double-count them.
-        if info.get("name", "") not in NETWORK_TX_EXCLUDE:
-            sums[f"net_{group}_tx"] += _read_net_tx(info.get("pid", "0"))
+        # tx-only so each byte is counted once at its sender; relays
+        # are unlabelled and therefore never reach this loop.
+        sums[f"net_{group}_tx"] += _read_net_tx(info.get("pid", "0"))
 
     if missing:
         # A labelled container was restarted between snapshots — rebuild

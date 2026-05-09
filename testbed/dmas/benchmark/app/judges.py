@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 
 from app.prompts import judge as judge_prompts
 
@@ -34,14 +35,46 @@ class JudgeAggregate:
     n: int = 0
 
 
-_client: OpenAI | None = None
+# Judge bypasses litellm so its tokens stay out of the SUT /metrics
+# totals; this dual-client setup is the direct-OpenAI equivalent of
+# litellm's pool fallback.
+_clients: dict[str, OpenAI | None] = {"primary": None, "backup": None}
+_PING_PONG_ATTEMPTS = 4
 
 
-def _openai_client() -> OpenAI:
-    global _client
-    if _client is None:
-        _client = OpenAI()
-    return _client
+def _client_for(slot: str) -> OpenAI | None:
+    if _clients[slot] is not None:
+        return _clients[slot]
+    if slot == "primary":
+        if not os.getenv("OPENAI_API_KEY"):
+            return None
+        _clients[slot] = OpenAI()
+    else:
+        key = (os.getenv("OPENAI_API_KEY_BACKUP") or "").strip()
+        # docker-compose defaults OPENAI_API_KEY_BACKUP to OPENAI_API_KEY
+        # so the litellm pool stays healthy when no real backup is set;
+        # for the judge that means "same key twice", which would just
+        # double-hit the same rate limit. Treat dup as no backup.
+        primary_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+        if not key or key == primary_key:
+            return None
+        _clients[slot] = OpenAI(api_key=key)
+    return _clients[slot]
+
+
+def _client_chain() -> list[OpenAI]:
+    chain: list[OpenAI] = []
+    primary = _client_for("primary")
+    if primary is not None:
+        chain.append(primary)
+    backup = _client_for("backup")
+    if backup is not None:
+        chain.append(backup)
+    if not chain:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set; the judge cannot reach OpenAI."
+        )
+    return chain
 
 
 def _grade_label(raw: str) -> tuple[str, str]:
@@ -63,16 +96,28 @@ def _grade_label(raw: str) -> tuple[str, str]:
 
 
 def _call(model: str, system: str, user: str) -> str:
-    resp = _openai_client().chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0,
-        response_format={"type": "json_object"},
-    )
-    return resp.choices[0].message.content or ""
+    """Judge completion with primary/backup ping-pong on 429."""
+    chain = _client_chain()
+    last_err: RateLimitError | None = None
+    for i in range(_PING_PONG_ATTEMPTS):
+        client = chain[i % len(chain)]
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0,
+                response_format={"type": "json_object"},
+            )
+            return resp.choices[0].message.content or ""
+        except RateLimitError as exc:
+            last_err = exc
+            if len(chain) == 1:
+                break
+    assert last_err is not None
+    raise last_err
 
 
 def judge(question: str, gold_answer: str, response: str) -> JudgeResult:

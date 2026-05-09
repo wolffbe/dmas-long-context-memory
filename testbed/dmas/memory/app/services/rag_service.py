@@ -12,6 +12,7 @@ from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
+from shared.errors import exc_trace
 from shared.litellm_usage import usage_snapshot_sync as usage_snapshot, diff as usage_diff
 
 logger = logging.getLogger(__name__)
@@ -188,11 +189,13 @@ class RagService:
                     logger.exception("RAG ingest failed: conv %d %s turn %d",
                                      conv_index, session_key, turn_idx)
                     failed += 1
-                    failures.append({"session": session_key, "chunk_idx": turn_idx, "error": str(exc)})
+                    err_compact = exc_trace(exc)
+                    failures.append({"session": session_key, "chunk_idx": turn_idx, "error": err_compact})
                     yield {
                         "event": "memory",
                         "session": session_key, "chunk_idx": turn_idx,
-                        "status": "failed", "preview": preview, "error": str(exc)[:300],
+                        "status": "failed", "preview": preview,
+                        "error": err_compact[:300],
                         "wall_ms": m_wall_ms,
                         **du,
                     }

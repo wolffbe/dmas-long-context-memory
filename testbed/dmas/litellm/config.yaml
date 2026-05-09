@@ -1,0 +1,63 @@
+model_list:
+  # `@OLLAMA_MODEL@` is substituted from env at container start (sed in
+  # the litellm service entrypoint) — LiteLLM itself does not expand
+  # ${VAR} in model_name/model, so we template it before the proxy boots.
+  # `ollama_chat/` (not bare `ollama/`) targets Ollama's /api/chat so
+  # `choices[0].message.content` is populated for the coordinator loop.
+  - model_name: "@OLLAMA_MODEL@"
+    litellm_params:
+      model: "ollama_chat/@OLLAMA_MODEL@"
+      api_base: http://ollama:11434
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+
+  # Two deployments per model_name → router treats them as a pool and
+  # rotates onto the backup key on 429. OPENAI_API_KEY_BACKUP defaults
+  # to OPENAI_API_KEY in docker-compose, so the second deployment is
+  # always reachable (redundant when no real backup is set).
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY_BACKUP
+
+  - model_name: text-embedding-3-small
+    litellm_params:
+      model: openai/text-embedding-3-small
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: text-embedding-3-small
+    litellm_params:
+      model: openai/text-embedding-3-small
+      api_key: os.environ/OPENAI_API_KEY_BACKUP
+
+litellm_settings:
+  drop_params: true
+  # The "prometheus" callback is what makes litellm expose its
+  # /metrics endpoint with the litellm_total_tokens_metric_total +
+  # litellm_spend_metric_total counters. The bench reads /metrics
+  # directly (no Prometheus server), but this callback is still
+  # required to populate those counters. Don't remove.
+  # `otel` exports each completion as a `gen_ai.*` span via OTLP to
+  # langfuse-web v3 — endpoint + Basic-auth header come from
+  # OTEL_EXPORTER_OTLP_* env in docker-compose.yml. With W3C
+  # `traceparent` propagated by the OpenAI SDK's HTTP client, each
+  # gen_ai span nests under the caller's manual span (e.g.
+  # `memory.persist`) instead of forming a standalone trace.
+  success_callback: ["otel", "prometheus"]
+  failure_callback: ["otel", "prometheus"]
+  redact_user_api_key_info: true
+  # retry_after=0 + cooldown_time=0 (router_settings) → no artificial
+  # delay between primary/backup alternations. Upstream `Retry-After`
+  # is still honoured per-deployment.
+  num_retries: 1470
+  retry_after: 0
+  request_timeout: 600
+
+router_settings:
+  cooldown_time: 0
+
+general_settings:
+  master_key: sk-litellm-master

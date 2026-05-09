@@ -6,9 +6,14 @@ services:
     ports:
       - "127.0.0.1:4000:4000"
     volumes:
-      - ./litellm/config.yaml:/app/config.yaml:ro
+      # Mounted as a template; entrypoint sed-substitutes @OLLAMA_MODEL@
+      # into a runtime copy at /tmp/config.yaml before exec'ing litellm.
+      - ./litellm/config.yaml:/app/config.yaml.tpl:ro
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # Defaults to the primary so the backup deployment in litellm/config.yaml
+      # is always reachable; setting a real second key activates ping-pong.
+      - OPENAI_API_KEY_BACKUP=${OPENAI_API_KEY_BACKUP:-${OPENAI_API_KEY}}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
       # OTel callback — each completion is exported as a `gen_ai.*` span
       # via OTLP/HTTP to langfuse-web v3. Replaces the v2 Langfuse SDK
@@ -33,12 +38,18 @@ services:
       # it). The `:-` fallback keeps the env defined when keys are absent
       # so the container still boots.
       - OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic ${LANGFUSE_OTEL_BASIC_AUTH:-}
-    command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        : "$${OLLAMA_MODEL:?OLLAMA_MODEL must be set}"
+        sed "s|@OLLAMA_MODEL@|$$OLLAMA_MODEL|g" /app/config.yaml.tpl > /tmp/config.yaml
+        exec litellm --config /tmp/config.yaml --port 4000 --host 0.0.0.0
     networks:
       - dmas-network
     restart: unless-stopped
-    labels:
-      - "group=cloud"
+    # Unlabelled: gateway in front of the SUT, serves both edge and
+    # cloud models. Tokens/cost are recovered from /metrics by model.
     logging:
       driver: "json-file"
       options:
@@ -262,8 +273,8 @@ services:
       - "127.0.0.1:8006:18006" # listen to Responder
     command: ["-host=0.0.0.0"]
     restart: unless-stopped
-    labels:
-      - "group=cloud"
+    # Unlabelled: pass-through relay; counting its tx would double the
+    # bytes its upstream container already sent.
 
   benchmark:
     build:
@@ -280,6 +291,7 @@ services:
       - PROC_ROOT=/host-proc
       - TOXIPROXY_ADMINS=http://toxiproxy:8474
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_KEY_BACKUP=${OPENAI_API_KEY_BACKUP:-${OPENAI_API_KEY}}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
       - RESULTS_DIR=/results
       - LANGFUSE_HOST=http://langfuse-web:3000
@@ -295,8 +307,8 @@ services:
     networks:
       - dmas-network
     restart: unless-stopped
-    labels:
-      - "group=cloud"
+    # Unlabelled: this is the measurement harness; including it would
+    # fold the snapshotting loop's own cost into every row.
   qdrant:
     image: qdrant/qdrant:latest
     container_name: qdrant

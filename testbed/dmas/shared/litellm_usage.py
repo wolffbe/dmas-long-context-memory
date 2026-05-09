@@ -27,14 +27,11 @@ LITELLM_METRICS_URL = os.getenv(
 
 
 def _edge_models() -> set[str]:
-    """Models LiteLLM serves locally (Ollama). Includes both the LiteLLM
-    alias the coordinator actually requests (`local-slm`) and the raw
-    Ollama tag — LiteLLM's metric labels can carry either depending on
-    which one wins the labeling race in `requested_model` vs `model`."""
+    """Models LiteLLM serves locally (Ollama). Defaults to the single
+    OLLAMA_MODEL tag — both `model_name` and `model` in the templated
+    litellm config substitute to it, so no separate alias is needed."""
     raw = os.getenv("EDGE_MODELS") or os.getenv("OLLAMA_MODEL", "")
-    models = {m.strip() for m in raw.split(",") if m.strip()}
-    models.add("local-slm")
-    return models
+    return {m.strip() for m in raw.split(",") if m.strip()}
 
 
 _LINE = re.compile(

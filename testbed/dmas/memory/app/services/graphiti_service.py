@@ -17,6 +17,7 @@ from graphiti_core.search.search_config_recipes import (
     NODE_HYBRID_SEARCH_RRF,
 )
 
+from shared.errors import exc_trace
 from shared.litellm_usage import usage_snapshot_sync as usage_snapshot, diff as usage_diff
 from app.services.mem0_service import parse_locomo_date
 
@@ -215,9 +216,10 @@ class GraphitiService:
                     du = usage_diff(u0, u1)
                     logger.exception("Ingestion failed: conv %d %s", conv_index, session_key)
                     failed += 1
+                    err_compact = exc_trace(exc)
                     failures.append({
                         "session": session_key,
-                        "error": str(exc),
+                        "error": err_compact,
                     })
                     logger.info(
                         "[graphiti load] conv=%d %d/%d %s FAILED wall=%.2fs | %s",
@@ -226,7 +228,8 @@ class GraphitiService:
                     yield {
                         "event": "memory",
                         "session": session_key, "chunk_idx": msg_idx,
-                        "status": "failed", "preview": preview, "error": str(exc)[:300],
+                        "status": "failed", "preview": preview,
+                        "error": err_compact[:300],
                         "wall_ms": m_wall_ms,
                         **du,
                     }

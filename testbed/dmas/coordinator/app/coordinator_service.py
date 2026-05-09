@@ -61,10 +61,9 @@ class CoordinatorService:
         self.memory_url = memory_url
         self.responder_url = responder_url
         # Pass the bare ollama model tag straight through. LiteLLM's
-        # `model_list` (litellm/config.yaml) registers one entry per
-        # OLLAMA_MODEL value with the same name; passing the tag here
-        # makes langfuse generations render as e.g.
-        # `qwen2.5:3b-instruct-q4_K_M` instead of `local-slm`.
+        # `model_list` is templated from OLLAMA_MODEL at boot, so the
+        # alias matches the tag exactly — langfuse generations render as
+        # e.g. `qwen2.5:3b-instruct-q4_K_M` rather than an opaque alias.
         self.ollama_model = ollama_model or os.getenv("OLLAMA_MODEL", "")
         if not self.ollama_model:
             raise RuntimeError(

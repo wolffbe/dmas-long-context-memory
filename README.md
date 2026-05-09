@@ -2,7 +2,10 @@
 
 A distributed multi-agent system testbed for benchmarking five long-term conversational memory strategies under different network scenarios.
 
-![dmas](docs/dmas.png)
+The repository has two top-level portions:
+
+- **`paper/`** — the manuscript sources and figures.
+- **`testbed/`** — the runnable benchmark: docker-compose stack, memory services, judge, experiment harness, and result CSVs / analysis notebook. **All commands in this README run from `testbed/`** (e.g. `cd testbed && make build`); paths shown like `dmas/...`, `experiments/...`, `Makefile`, `.env` are relative to that directory.
 
 ## Overview
 
@@ -86,8 +89,8 @@ The litellm proxy has **no** `openai/*` catch-all — any unexpected model name 
 Two layers, kept independent so each can answer different questions:
 
 **Resource accounting (CSVs, kernel counters).** The bench reads counters straight from kernel pseudo-files — no Prometheus, no Telegraf, no scrape interval. Every snapshot reflects the moment of the read.
-- **`/sys/fs/cgroup`** (mounted ro) — per-container CPU (`cpu.stat`), RAM (`memory.peak`), disk (`io.stat`). Containers are partitioned via the `group=edge|cloud` label; everything unlabelled (langfuse infra) is excluded so observability never inflates the numbers under test.
-- **`/proc/<pid>/net/dev`** (host `/proc` mounted ro) — per-namespace network counters; tx-only, toxiproxy excluded so each byte is counted once at its sender.
+- **`/sys/fs/cgroup`** (mounted ro) — per-container CPU (`cpu.stat`), RAM (`memory.peak`), disk (`io.stat`). Containers are partitioned via the `group=edge|cloud` label; everything unlabelled (langfuse infra, the litellm gateway, the toxiproxy network shim, and the benchmark harness itself) is excluded so observability, pass-through hops, and the measurement loop never inflate the numbers under test.
+- **`/proc/<pid>/net/dev`** (host `/proc` mounted ro) — per-namespace network counters; tx-only, and only over the labelled SUT containers, so each byte is counted once at its true sender (relay re-transmits drop out automatically).
 - **`/var/run/docker.sock`** (mounted ro) — one-shot container label/PID lookup, cached.
 - **`litellm:4000/metrics`** — live tokens/cost counters, split by model name into edge (ollama-served) vs cloud (OpenAI passthrough).
 
@@ -139,7 +142,10 @@ make experiment ──▶ benchmark ──▶ /experiment
 
 ### First run
 
+All commands run from `testbed/` — the `Makefile`, `.env`, and `docker-compose.yml` all live there.
+
 ```bash
+cd testbed
 cp .env.example .env
 # edit .env, set OPENAI_API_KEY=sk-...
 
@@ -194,13 +200,32 @@ The benchmark dedupes per CSV row, so any failure that leaves the per-experiment
 
 How to resume: kill any run with Ctrl-C and re-issue the same `make` command. The next call rebuilds resume state from the CSVs on disk; per-experiment files are partitioned by `(name_prefix, backend, mode)` (filename `{prefix}{backend}_{mode}.csv`), and convs share a file, distinguished by the `conversation_index` column. If a leg got stuck mid-load with the memory backend in a half-loaded state, the next call sees the existing `phase=load` rows and resumes from message N+1 against whatever the backend already persisted; for that to work, `KEEP_STATE=1` (smoke targets default to this) or the operator must not run `make clean` between the failure and the retry — `make clean` drops Qdrant + Neo4j volumes, after which the CSV says "loaded" but the backend is empty.
 
+### Failure diagnostics
+
+The `error` column on failed rows is populated by `dmas/shared/errors.py:exc_trace`, which formats the exception so the failing site survives the cell-width truncation. Two shapes:
+
+- **Local code failure** (raised in cognee/mem0/graphiti/rag library or our wrapper) — `ExcType: msg @ <file>:<line> in <func> | tb_tail: …`. The deepest frame names the offending source file and function directly, so a sticky bug like the cognee-0.5.6 `'float' object has no attribute 'replace'` becomes greppable to its origin without rerunning.
+- **LiteLLM / upstream failure** (any exception with `.status_code` or `.body` — covers the entire `openai.APIError` tree) — `ExcType: msg @ <file>:<line> | status=<code> body=<litellm error JSON>`. The `body` carries LiteLLM's error envelope, typically including `litellm.<RateLimit|ContextWindow|Auth|Timeout>Error`, `provider=openai|ollama`, and `model=<name>`, so upstream failures are diagnosable from the CSV alone — no need to grep `docker logs litellm`.
+
+Wired in for cognee, mem0, graphiti, and rag load handlers. `phase=load, status=failed` rows count toward "done" for resume purposes; to force a retry, delete the row from the CSV before re-running.
+
+### Rate-limit ping-pong
+
+`OPENAI_API_KEY_BACKUP` (env) plumbs an optional second OpenAI key. With it set:
+
+- LiteLLM pools both keys under each `model_name` (see `dmas/litellm/config.yaml`); `router_settings.cooldown_time: 0` and `litellm_settings.retry_after: 0` mean a 429 from one deployment immediately rotates to the other with no artificial delay (upstream `Retry-After` is still honoured per-deployment).
+- The judge — which calls OpenAI directly, bypassing litellm to keep judge tokens out of the SUT `/metrics` totals — runs its own ping-pong loop in `benchmark/app/judges.py:_call`, alternating primary→backup→primary→backup for up to 4 attempts before surfacing the 429 as an `ERROR` row.
+
+When `OPENAI_API_KEY_BACKUP` is unset it defaults to `OPENAI_API_KEY` in `docker-compose.yml`, so the litellm backup deployment stays healthy (redundant rather than 401-thrashing) and the judge correctly degrades to single-key behaviour (the duplicate-key check skips a same-key retry).
+
 ## Configuration
 
 ### Environment variables
 
 | Variable                 | Description                                                                | Default                          |
 | ------------------------ | -------------------------------------------------------------------------- | -------------------------------- |
-| `OPENAI_API_KEY`         | Real OpenAI key — used only by litellm; agents see `sk-litellm-master`.    | (required, set in `.env`)        |
+| `OPENAI_API_KEY`         | Real OpenAI key — used by litellm and the judge; agents see `sk-litellm-master` and route through litellm. | (required, set in `.env`)        |
+| `OPENAI_API_KEY_BACKUP`  | Optional second OpenAI key. Both litellm (pooled deployments, `cooldown_time=0`) and the judge ping-pong onto it on a 429 with no artificial delay. Defaults to `OPENAI_API_KEY` if unset, so the backup deployment is always reachable but adds no real fallback. | (defaults to `OPENAI_API_KEY`)   |
 | `LLM_MODEL`              | Cloud chat/completion model — used by responder, judge, and the mem0/graphiti/cognee extractors. | `gpt-4o-mini`                    |
 | `OLLAMA_MODEL`           | Local SLM the coordinator calls via litellm.                               | `qwen2.5:3b-instruct-q4_K_M`     |
 | `RAG_EMBED_MODEL`        | Embedding model for vector retrieval (mem0/graphiti/cognee/rag).           | `text-embedding-3-small`         |
@@ -224,20 +249,22 @@ Per `MODE`: `unconstrained` clears all toxics; `constrained` applies `CONSTRAINE
 
 ```
 dmas-memory/
-├── dmas/
-│   ├── benchmark/        # Experiment runner: /experiment (drives /memorize per message + ASK loop), judges, metrics, per-experiment CSV writer
-│   ├── coordinator/      # Slim /ask handler (Ollama tool-calling)
-│   ├── memory/           # mem0 + Graphiti + Cognee + RAG + FullContext (per-request backend selection)
-│   ├── responder/        # Final-answer generator
-│   ├── shared/           # otel_init.py, litellm_usage.py, models.py — copied into every service image; one canonical implementation
-│   ├── litellm/config.yaml   # Single LLM gateway: gpt-4o-mini + qwen2.5:3b + text-embedding-3-small (no catch-all)
-│   └── docker-compose.yml    # Build context is `dmas/` so each service image can COPY shared/
-├── experiments/
-│   ├── experiments.sh    # Thin wrapper around `make experiment`
-│   ├── results.ipynb     # Statistical analysis (§§1–9b) — every chapter renders a table followed by a bar chart with a constrained-vs-unconstrained Δ panel
-│   └── results/          # Per-experiment CSVs ({prefix}{backend}_{mode}.csv)
-├── Makefile
-└── .env.example
+├── paper/                # Manuscript sources and figures
+└── testbed/              # Runnable benchmark — `cd testbed` before any `make ...`
+    ├── dmas/
+    │   ├── benchmark/        # Experiment runner: /experiment (drives /memorize per message + ASK loop), judges, metrics, per-experiment CSV writer
+    │   ├── coordinator/      # Slim /ask handler (Ollama tool-calling)
+    │   ├── memory/           # mem0 + Graphiti + Cognee + RAG + FullContext (per-request backend selection)
+    │   ├── responder/        # Final-answer generator
+    │   ├── shared/           # otel_init.py, litellm_usage.py, models.py — copied into every service image; one canonical implementation
+    │   ├── litellm/config.yaml   # Single LLM gateway: gpt-4o-mini + qwen2.5:3b + text-embedding-3-small (no catch-all)
+    │   └── docker-compose.yml    # Build context is `dmas/` so each service image can COPY shared/
+    ├── experiments/
+    │   ├── experiments.sh    # Thin wrapper around `make experiment`
+    │   ├── results.ipynb     # Statistical analysis (§§1–9b) — every chapter renders a table followed by a bar chart with a constrained-vs-unconstrained Δ panel
+    │   └── results/          # Per-experiment CSVs ({prefix}{backend}_{mode}.csv)
+    ├── Makefile
+    └── .env.example
 ```
 
 ## Analysis
@@ -285,10 +312,10 @@ The judge prompt is verbatim from Zep's `locomo_grader` (`getzep/zep-papers, kg_
 
 The bench reads kernel pseudo-files directly — no TSDB middleman, no scrape interval rounding:
 
-- **CPU / disk / network** — `/sys/fs/cgroup/.../{cpu.stat, io.stat}` + `/proc/<container_pid>/net/dev`. Network is **tx-only** so each byte is counted once at its sender; toxiproxy is excluded from tx aggregation because its tx is just retransmit of upstream bytes. `dmas/benchmark/app/cgroup_metrics.py` maps each container_id → `group=edge|cloud` via the docker socket and sums per group.
+- **CPU / disk / network** — `/sys/fs/cgroup/.../{cpu.stat, io.stat}` + `/proc/<container_pid>/net/dev`. Network is **tx-only** so each byte is counted once at its sender; pass-through relays (litellm, toxiproxy) carry no `group=` label and are therefore omitted from aggregation, so their re-transmits don't double-count the bytes their upstream containers already sent. `dmas/benchmark/app/cgroup_metrics.py` maps each container_id → `group=edge|cloud` via the docker socket and sums per group.
 - **RAM** — diff of `memory.peak` between two snapshots. Captures the *additional* working-set high-water mark induced by the call (non-negative, monotonic). Stored as `ram_*_peak_bytes` so consumers don't mistake it for a `memory.current` average.
 - **Disk attribution under async DBs** — Neo4j and Qdrant both checkpoint asynchronously; without intervention, per-call `disk_cloud_bytes` would understate Graphiti's and Cognee's writes. The bench (a) sets Neo4j `db.checkpoint.interval.tx=1` so it checkpoints after every transaction, (b) blocks the t1 cgroup snapshot until **cloud-group disk I/O quiesces** (`wait_io_quiet` in `cgroup_metrics.py`, group-wide aggregate so Qdrant is included too), and (c) reports the added wait as `flush_ms` so it's distinguishable from `compute_ms` (the production-equivalent latency). Edge group is excluded from the quiescence check because Ollama doesn't flush asynchronously.
-- **Tokens / cost** — `litellm:4000/metrics`, parsed live before+after each call. Split by the `model` label into edge (ollama via the `local-slm` alias → `qwen2.5:3b-instruct-q4_K_M`, free in litellm pricing) vs cloud (OpenAI passthrough). LiteLLM does the per-model price lookup; no pricing JSON to maintain.
+- **Tokens / cost** — `litellm:4000/metrics`, parsed live before+after each call. Split by the `model` label into edge (ollama-served, e.g. `qwen2.5:3b-instruct-q4_K_M`, free in litellm pricing) vs cloud (OpenAI passthrough). LiteLLM does the per-model price lookup; no pricing JSON to maintain.
 - **Responder context length** — the `prompt_tokens` of the OpenAI completion that produced the final answer is captured in `responder_context_tokens`, so analyses can normalise accuracy by how much retrieved context the responder had to process per question.
 
 Each row reflects the actual call window — even sub-second calls get real per-row deltas.
