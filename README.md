@@ -140,6 +140,8 @@ make experiment ──▶ benchmark ──▶ /experiment
 - An OpenAI API key
 - ~12 GB RAM (Ollama + Neo4j + Qdrant)
 
+On Linux (Debian/Ubuntu) or macOS, run `sudo bash install.sh` from `testbed/` to install `make`, Docker, and Claude Code and verify each is working.
+
 ### First run
 
 All commands run from `testbed/` — the `Makefile`, `.env`, and `docker-compose.yml` all live there.
