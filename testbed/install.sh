@@ -11,6 +11,10 @@
 
 set -eu
 
+# Pinned Docker versions for reproducibility. Bump these to upgrade.
+DOCKER_ENGINE_VERSION="27.5.1"     # apt-based Linux (docker-ce / docker-ce-cli)
+DOCKER_DESKTOP_VERSION="4.37.2"    # Windows winget (Docker.DockerDesktop)
+
 DOCKER_GROUP_ADDED=0
 SUDO=""
 if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
@@ -118,14 +122,25 @@ install_linux() {
     $SUDO apt-get install -y curl ca-certificates gnupg lsb-release make
 
     if ! command -v docker >/dev/null 2>&1; then
-        log "installing Docker Engine"
+        log "installing Docker Engine ${DOCKER_ENGINE_VERSION}"
         $SUDO install -m 0755 -d /etc/apt/keyrings
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg
         $SUDO chmod a+r /etc/apt/keyrings/docker.gpg
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
             | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
         $SUDO apt-get update -y
-        $SUDO apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+        # apt versions for docker-ce are codename-suffixed
+        # (e.g. "5:27.5.1-1~ubuntu.22.04~jammy"). Resolve the matching
+        # version string for this host's codename instead of hard-coding it.
+        pkg_ver=$(apt-cache madison docker-ce | awk '{print $3}' | grep -m1 -- "${DOCKER_ENGINE_VERSION}" || true)
+        [ -n "$pkg_ver" ] || fail "Docker Engine ${DOCKER_ENGINE_VERSION} not available for $(lsb_release -cs)"
+        $SUDO apt-get install -y \
+            docker-ce="${pkg_ver}" \
+            docker-ce-cli="${pkg_ver}" \
+            containerd.io \
+            docker-buildx-plugin \
+            docker-compose-plugin
     fi
 
     if command -v systemctl >/dev/null 2>&1; then
@@ -156,6 +171,10 @@ install_macos() {
     fi
 
     brew install make
+    # Homebrew Cask doesn't support pinning to arbitrary historical
+    # versions without maintaining a versioned tap, so macOS gets the
+    # current stable Docker Desktop cask. Bump the Linux/Windows pins
+    # above when this drifts too far from the team's target.
     brew list --cask docker >/dev/null 2>&1 || brew install --cask docker
 
     start_docker_daemon
@@ -180,10 +199,10 @@ install_windows() {
     fi
 
     if ! command -v docker >/dev/null 2>&1; then
-        log "installing Docker Desktop"
-        winget install --id Docker.DockerDesktop --silent \
+        log "installing Docker Desktop ${DOCKER_DESKTOP_VERSION}"
+        winget install --id Docker.DockerDesktop --version "${DOCKER_DESKTOP_VERSION}" --silent \
             --accept-source-agreements --accept-package-agreements \
-            || fail "winget failed to install Docker Desktop"
+            || fail "winget failed to install Docker Desktop ${DOCKER_DESKTOP_VERSION}"
     fi
 
     start_docker_daemon
