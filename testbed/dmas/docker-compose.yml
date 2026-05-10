@@ -294,6 +294,9 @@ services:
       - OPENAI_API_KEY_BACKUP=${OPENAI_API_KEY_BACKUP:-${OPENAI_API_KEY}}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
       - RESULTS_DIR=/results
+      - CONSTRAINED_LATENCY_MS=150
+      - CONSTRAINED_JITTER_MS=30
+      - CONSTRAINED_BANDWIDTH_KBPS=512
       - LANGFUSE_HOST=http://langfuse-web:3000
       - LANGFUSE_PUBLIC_URL=${LANGFUSE_PUBLIC_URL:-http://localhost:3000}
       - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
@@ -320,8 +323,8 @@ services:
     networks:
       - memory-internal
     restart: unless-stopped
-    labels:
-      - "group=cloud"
+    # no group= label: qdrant is internal storage, not a measured service boundary.
+    # Its TX bytes are intra-AZ traffic (memory-internal bridge) — zero egress cost.
   neo4j:
     image: neo4j:5.26
     container_name: neo4j
@@ -345,8 +348,8 @@ services:
     networks:
       - memory-internal
     restart: unless-stopped
-    labels:
-      - "group=cloud"
+    # no group= label: neo4j is internal storage, not a measured service boundary.
+    # Its TX bytes are intra-AZ traffic (memory-internal bridge) — zero egress cost.
   memory:
     build:
       context: .

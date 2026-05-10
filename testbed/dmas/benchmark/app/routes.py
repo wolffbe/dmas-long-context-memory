@@ -67,8 +67,8 @@ VALID_BACKENDS = ("mem0", "graphiti", "rag", "cognee", "full_context")
 # Constrained-mode network profile. Single source of truth: the operator
 # picks the *mode*, the benchmark picks the toxic values. Override per
 # deployment via env if a different regime is desired.
-CONSTRAINED_LATENCY = float(os.getenv("CONSTRAINED_LATENCY_MS", "100"))
-CONSTRAINED_JITTER = float(os.getenv("CONSTRAINED_JITTER_MS", "20"))
+CONSTRAINED_LATENCY = float(os.getenv("CONSTRAINED_LATENCY_MS", "150"))
+CONSTRAINED_JITTER = float(os.getenv("CONSTRAINED_JITTER_MS", "30"))
 CONSTRAINED_BANDWIDTH = float(os.getenv("CONSTRAINED_BANDWIDTH_KBPS", "512"))
 
 
