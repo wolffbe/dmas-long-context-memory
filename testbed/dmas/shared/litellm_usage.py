@@ -20,9 +20,18 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-LITELLM_METRICS_URL = os.getenv(
-    "LITELLM_METRICS_URL",
-    "http://litellm:4000/metrics",
+# Comma-separated list of /metrics endpoints. With the edge/cloud split
+# there are two litellm instances; each exposes its own counters and
+# they're summed at read time. Falls back to LITELLM_METRICS_URL
+# (singular) for any service still wired to a single endpoint, and to
+# the cloud default as a last resort.
+_RAW_URLS = (
+    os.getenv("LITELLM_METRICS_URLS")
+    or os.getenv("LITELLM_METRICS_URL")
+    or "http://litellm-cloud:4000/metrics"
+)
+LITELLM_METRICS_URLS: tuple[str, ...] = tuple(
+    u.strip() for u in _RAW_URLS.split(",") if u.strip()
 )
 
 
@@ -68,32 +77,51 @@ def _parse(text: str) -> dict[str, float]:
 _sync_client = httpx.Client(timeout=2.0, follow_redirects=True)
 
 
-def usage_snapshot_sync() -> dict[str, float]:
-    """Return per-group totals at the current instant (sync).
+def _zero() -> dict[str, float]:
+    return {"edge_tokens": 0.0, "edge_cost": 0.0,
+            "cloud_tokens": 0.0, "cloud_cost": 0.0}
 
-    Failures degrade to all-zero so a flaky read never mis-attributes
-    a delta later.
+
+def _accumulate(acc: dict[str, float], parsed: dict[str, float]) -> None:
+    for k, v in parsed.items():
+        if k.endswith("_tokens"):
+            acc[k] = int(acc.get(k, 0)) + int(v)
+        else:
+            acc[k] = float(acc.get(k, 0.0)) + float(v)
+
+
+def usage_snapshot_sync() -> dict[str, float]:
+    """Return per-group totals at the current instant (sync), summed
+    across every endpoint in LITELLM_METRICS_URLS.
+
+    Failures on any single endpoint degrade to all-zero for that one
+    and the others still contribute — partial reads never mis-attribute
+    a delta later because both t0 and t1 see the same set of failures.
     """
-    try:
-        text = _sync_client.get(LITELLM_METRICS_URL).text
-    except Exception as exc:
-        logger.debug("litellm /metrics fetch failed: %s", exc)
-        return {"edge_tokens": 0.0, "edge_cost": 0.0,
-                "cloud_tokens": 0.0, "cloud_cost": 0.0}
-    return _parse(text)
+    total = _zero()
+    for url in LITELLM_METRICS_URLS:
+        try:
+            text = _sync_client.get(url).text
+        except Exception as exc:
+            logger.debug("litellm /metrics fetch failed (%s): %s", url, exc)
+            continue
+        _accumulate(total, _parse(text))
+    return total
 
 
 async def usage_snapshot_async(client: httpx.AsyncClient) -> dict[str, float]:
     """Async equivalent of `usage_snapshot_sync`. Caller-supplied client
     so connection pooling stays under the caller's control."""
-    try:
-        r = await client.get(LITELLM_METRICS_URL, timeout=2.0, follow_redirects=True)
-        text = r.text
-    except Exception as exc:
-        logger.debug("litellm /metrics fetch failed: %s", exc)
-        return {"edge_tokens": 0.0, "edge_cost": 0.0,
-                "cloud_tokens": 0.0, "cloud_cost": 0.0}
-    return _parse(text)
+    total = _zero()
+    for url in LITELLM_METRICS_URLS:
+        try:
+            r = await client.get(url, timeout=2.0, follow_redirects=True)
+            text = r.text
+        except Exception as exc:
+            logger.debug("litellm /metrics fetch failed (%s): %s", url, exc)
+            continue
+        _accumulate(total, _parse(text))
+    return total
 
 
 def diff(t0: dict[str, float], t1: dict[str, float]) -> dict[str, float]:

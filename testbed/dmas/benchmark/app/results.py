@@ -70,7 +70,10 @@ COLUMNS = [
     "cpu_edge_ns", "cpu_cloud_ns",
     "ram_edge_peak_bytes", "ram_cloud_peak_bytes",
     "disk_edge_bytes", "disk_cloud_bytes",
-    "network_edge_bytes", "network_cloud_bytes",
+    # Directional edge↔cloud bytes, read at the toxiproxy gateway's
+    # edge-net veth. No intra-cloud or storage traffic is included by
+    # construction — see cgroup_metrics.delta() for the wiring.
+    "network_edge_to_cloud_bytes", "network_cloud_to_edge_bytes",
     # LLM tokens/cost split by where the model is served:
     #   edge_llm_* — local ollama (free in litellm pricing).
     #   cloud_llm_* — OpenAI passthrough.

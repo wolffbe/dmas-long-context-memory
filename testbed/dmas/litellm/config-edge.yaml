@@ -1,0 +1,31 @@
+model_list:
+  # `@OLLAMA_MODEL@` is substituted from env at container start (sed in
+  # the litellm service entrypoint) — LiteLLM itself does not expand
+  # ${VAR} in model_name/model, so we template it before the proxy boots.
+  # `ollama_chat/` (not bare `ollama/`) targets Ollama's /api/chat so
+  # `choices[0].message.content` is populated for the coordinator loop.
+  - model_name: "@OLLAMA_MODEL@"
+    litellm_params:
+      model: "ollama_chat/@OLLAMA_MODEL@"
+      api_base: http://ollama:11434
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+
+litellm_settings:
+  drop_params: true
+  # `otel` + `prometheus` callbacks behave identically to the cloud
+  # config — see config-cloud.yaml for details. Edge-side litellm only
+  # serves the local ollama model; cloud routes are intentionally absent
+  # so an edge component cannot accidentally cross the partition.
+  success_callback: ["otel", "prometheus"]
+  failure_callback: ["otel", "prometheus"]
+  redact_user_api_key_info: true
+  num_retries: 1470
+  retry_after: 0
+  request_timeout: 600
+
+router_settings:
+  cooldown_time: 0
+
+general_settings:
+  master_key: sk-litellm-master

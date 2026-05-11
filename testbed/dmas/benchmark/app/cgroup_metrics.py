@@ -6,19 +6,23 @@ moment of access. No telegraf scrape interval, no docker daemon stats
 cache. Two snapshots straddling a 200 ms `.add()` give a real 200 ms
 delta.
 
-cgroup v2 does not include network counters (those live per net-ns).
-For network we read `/proc/<container_pid>/net/dev` from the host's
-proc mount — also kernel-real-time.
+CPU/RAM/disk are per-container, summed by `group=edge|cloud` label.
 
-Container labels (`group=edge|cloud`) and PIDs come from the docker
-daemon via docker-proxy. Cached per process; the cache is rebuilt
-whenever a labelled container's scope dir disappears (restart).
+Network is measured at the single edge↔cloud gateway (`toxiproxy`): its
+edge-net interface is the only path between the two data-plane subnets
+by construction (responder↔memory go direct on cloud-net, OTel/admin
+go over mgmt-net). One pair of counters — rx_bytes (edge→cloud) and
+tx_bytes (cloud→edge) — replaces the prior per-container tx sum, which
+double-counted intra-cloud chatter and was inflated by storage traffic.
 """
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
+import socket
+import struct
 import time
 from pathlib import Path
 from typing import Any
@@ -31,8 +35,19 @@ CGROUP_ROOT = Path(os.getenv("CGROUP_ROOT", "/host-cgroup"))
 PROC_ROOT = Path(os.getenv("PROC_ROOT", "/host-proc"))
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
 
+# Gateway-veth metering: the bench finds this container, reads its
+# /proc/<pid>/net/route to identify the interface routing to
+# EDGE_NET_CIDR, then reads rx/tx on that interface for the edge↔cloud
+# counter. Defaults match docker-compose.yml.
+GATEWAY_CONTAINER = os.getenv("GATEWAY_CONTAINER", "toxiproxy")
+EDGE_NET_CIDR = os.getenv("EDGE_NET_CIDR", "172.30.1.0/24")
+
 # container_id -> {"group": "edge"|"cloud", "pid": str, "name": str}
 _label_cache: dict[str, dict[str, str]] = {}
+# Cached (pid, iface_name) for the gateway. Invalidated when the gateway
+# container is restarted (scope dir disappears) — same trigger as the
+# label cache rebuild.
+_gateway_cache: dict[str, str] | None = None
 _docker_client: httpx.AsyncClient | None = None
 
 
@@ -46,32 +61,54 @@ def _client() -> httpx.AsyncClient:
 
 
 async def _refresh_labels() -> None:
+    global _gateway_cache
     c = _client()
     r = await c.get("/containers/json", timeout=3.0)
     r.raise_for_status()
     new: dict[str, dict[str, str]] = {}
+    gateway_cid: str | None = None
+    gateway_pid: str | None = None
     for entry in r.json():
         cid = entry.get("Id", "")
         if not cid:
-            continue
-        group = (entry.get("Labels") or {}).get("group")
-        if group not in ("edge", "cloud"):
             continue
         # Names look like ["/toxiproxy"]; strip the leading slash.
         name = ""
         names = entry.get("Names") or []
         if names:
             name = names[0].lstrip("/")
+        group = (entry.get("Labels") or {}).get("group")
+        is_gateway = name == GATEWAY_CONTAINER
+        if group not in ("edge", "cloud") and not is_gateway:
+            continue
         try:
             ri = await c.get(f"/containers/{cid}/json", timeout=3.0)
             pid = ri.json().get("State", {}).get("Pid", 0)
         except Exception as exc:
             logger.debug("inspect %s failed: %s", cid[:12], exc)
             pid = 0
-        new[cid] = {"group": group, "pid": str(pid), "name": name}
+        if is_gateway:
+            gateway_cid = cid
+            gateway_pid = str(pid)
+        if group in ("edge", "cloud"):
+            new[cid] = {"group": group, "pid": str(pid), "name": name}
     _label_cache.clear()
     _label_cache.update(new)
-    logger.info("cgroup label cache: %d edge/cloud containers", len(new))
+    # Resolve the gateway's edge-net interface by route inspection. The
+    # iface name + container id are cached so steady-state snapshots only
+    # touch /proc/<pid>/net/dev for the one interface we care about, and
+    # the cid lets us detect gateway restarts via the scope-dir check.
+    _gateway_cache = None
+    if gateway_pid and gateway_pid != "0":
+        iface = _resolve_gateway_iface(gateway_pid, EDGE_NET_CIDR)
+        if iface:
+            _gateway_cache = {"cid": gateway_cid, "pid": gateway_pid, "iface": iface}
+            logger.info("gateway %s pid=%s edge-iface=%s", GATEWAY_CONTAINER, gateway_pid, iface)
+        else:
+            logger.warning("gateway %s pid=%s: no interface routes to %s — boundary counter will be 0",
+                           GATEWAY_CONTAINER, gateway_pid, EDGE_NET_CIDR)
+    logger.info("cgroup label cache: %d edge/cloud containers (gateway %s)",
+                len(new), "found" if _gateway_cache else "missing")
 
 
 def _read_cpu_usec(scope: Path) -> int:
@@ -118,34 +155,71 @@ def _read_io(scope: Path) -> tuple[int, int]:
     return rb, wb
 
 
-def _read_net_tx(pid: str) -> int:
-    """Return tx_bytes for the container's network namespace.
+def _resolve_gateway_iface(pid: str, cidr: str) -> str | None:
+    """Find the interface inside `pid`'s netns that routes to `cidr`.
 
-    We only count tx (not rx) so a transfer A→B isn't counted twice
-    (once as A.tx, once as B.rx). Each byte is attributed to its
-    sender. Pass-through relays (toxiproxy, litellm) are unlabelled and
-    therefore skipped entirely, so a relayed payload is counted once at
-    its true originator rather than at every hop.
+    `/proc/<pid>/net/route` columns: `Iface Destination Gateway Flags
+    RefCnt Use Metric Mask MTU Window IRTT`. Destination and Mask are
+    32-bit big-endian numbers serialized as little-endian hex (the
+    kernel writes them via `seq_printf("%08X", ...)` over the native-
+    order integer, which on x86_64 is little-endian). Decode each row,
+    OR dest with mask, and match against the target subnet.
+    """
+    try:
+        text = (PROC_ROOT / pid / "net" / "route").read_text()
+    except (FileNotFoundError, PermissionError):
+        return None
+    try:
+        target = ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        logger.warning("EDGE_NET_CIDR %r is not a valid CIDR", cidr)
+        return None
+    for line in text.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 8:
+            continue
+        iface, dest_hex, _gw, _flags, _r, _u, _m, mask_hex = parts[:8]
+        try:
+            dest = socket.inet_ntoa(struct.pack("<I", int(dest_hex, 16)))
+            mask = socket.inet_ntoa(struct.pack("<I", int(mask_hex, 16)))
+        except (ValueError, struct.error):
+            continue
+        try:
+            row_net = ipaddress.ip_network(f"{dest}/{mask}", strict=False)
+        except ValueError:
+            continue
+        if row_net == target:
+            return iface
+    return None
+
+
+def _read_iface_bytes(pid: str, iface: str) -> tuple[int, int]:
+    """Return (rx_bytes, tx_bytes) for `iface` in `pid`'s netns.
+
+    Format of /proc/<pid>/net/dev:
+        Inter-|   Receive                                                |  Transmit
+         face |bytes    packets errs drop fifo frame compressed multicast|bytes ...
+        eth0:   123456    789 ...                                          1000 ...
+
+    Columns: 0=iface (with trailing colon), 1=rx_bytes, 9=tx_bytes.
     """
     if not pid or pid == "0":
-        return 0
+        return 0, 0
     try:
         text = (PROC_ROOT / pid / "net" / "dev").read_text()
     except (FileNotFoundError, PermissionError):
-        return 0
-    tx = 0
+        return 0, 0
     for line in text.splitlines()[2:]:
         parts = line.split()
         if len(parts) < 17:
             continue
-        iface = parts[0].rstrip(":")
-        if iface == "lo":
+        if parts[0].rstrip(":") != iface:
             continue
         try:
-            tx += int(parts[9])
+            return int(parts[1]), int(parts[9])
         except ValueError:
-            pass
-    return tx
+            return 0, 0
+    return 0, 0
 
 
 async def snapshot(_unused_client: httpx.AsyncClient | None = None) -> dict[str, float]:
@@ -155,7 +229,11 @@ async def snapshot(_unused_client: httpx.AsyncClient | None = None) -> dict[str,
     docker queries go over the unix socket directly. Argument is renamed
     to avoid shadowing the module-level `_client()` factory.
     """
-    if not _label_cache:
+    if not _label_cache or _gateway_cache is None:
+        # Refresh whenever the gateway hasn't been resolved yet, even if
+        # we already have labeled containers cached. Otherwise a bench
+        # start before toxiproxy is ready leaves the boundary counter
+        # stuck at 0 for the rest of the run.
         try:
             await _refresh_labels()
         except Exception:
@@ -166,7 +244,10 @@ async def snapshot(_unused_client: httpx.AsyncClient | None = None) -> dict[str,
         "ram_edge_peak": 0, "ram_cloud_peak": 0,
         "disk_edge_read": 0, "disk_edge_write": 0,
         "disk_cloud_read": 0, "disk_cloud_write": 0,
-        "net_edge_tx": 0, "net_cloud_tx": 0,
+        # Gateway-veth rx/tx on toxiproxy's edge-net interface. rx = bytes
+        # arriving from edge (edge→cloud), tx = bytes leaving toward edge
+        # (cloud→edge). Filled below from the gateway cache.
+        "gw_edge_rx": 0, "gw_edge_tx": 0,
     }
     missing = False
     for cid, info in _label_cache.items():
@@ -182,9 +263,19 @@ async def snapshot(_unused_client: httpx.AsyncClient | None = None) -> dict[str,
         sums[f"ram_{group}_peak"] += mem_peak
         sums[f"disk_{group}_read"] += rb
         sums[f"disk_{group}_write"] += wb
-        # tx-only so each byte is counted once at its sender; relays
-        # are unlabelled and therefore never reach this loop.
-        sums[f"net_{group}_tx"] += _read_net_tx(info.get("pid", "0"))
+
+    if _gateway_cache:
+        gw_scope = CGROUP_ROOT / "system.slice" / f"docker-{_gateway_cache['cid']}.scope"
+        if gw_scope.exists():
+            rx, tx = _read_iface_bytes(_gateway_cache["pid"], _gateway_cache["iface"])
+            sums["gw_edge_rx"] = rx
+            sums["gw_edge_tx"] = tx
+        else:
+            # Gateway was restarted — its pid/iface mapping is stale.
+            # Mark for refresh; the boundary counter for this snapshot
+            # stays at 0, which is fine because the next call's t0/t1
+            # delta still cancels out around the gap.
+            missing = True
 
     if missing:
         # A labelled container was restarted between snapshots — rebuild
@@ -251,6 +342,11 @@ def delta(t0: dict[str, float], t1: dict[str, float]) -> dict[str, Any]:
         "ram_cloud_peak_bytes": d("ram_cloud_peak"),
         "disk_edge_bytes":     d("disk_edge_read") + d("disk_edge_write"),
         "disk_cloud_bytes":    d("disk_cloud_read") + d("disk_cloud_write"),
-        "network_edge_bytes":  d("net_edge_tx"),
-        "network_cloud_bytes": d("net_cloud_tx"),
+        # Directional edge↔cloud bytes read at the toxiproxy gateway's
+        # edge-net interface. rx = edge→cloud (coordinator into the cloud
+        # subnet), tx = cloud→edge (responses back). No double-count and
+        # no intra-cloud inflation — responder↔memory and memory↔storage
+        # never traverse this interface.
+        "network_edge_to_cloud_bytes": d("gw_edge_rx"),
+        "network_cloud_to_edge_bytes": d("gw_edge_tx"),
     }

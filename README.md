@@ -50,16 +50,30 @@ All three sweep both network regimes for one `CONV` (default 0), reuse the load 
 | `make start`          | Bring the full stack up. Langfuse pk/sk auto-generated on first run.                        |
 | `make stop`           | Stop containers; volumes preserved.                                                          |
 | `make clean`          | Stop + drop only memory volumes (`qdrant-data`, `neo4j-data`, `neo4j-logs`).                |
-| `make reset`          | Stop + drop **every** named volume and the dmas-network.                                     |
+| `make reset`          | Stop + drop **every** named volume. Compose-managed bridges are torn down by `stop` and re-created on the next `start`. |
 | `make experiment`     | Full sweep: 10 LOCOMO convs × {unconstrained, constrained} × 5 backends × 3-judge majority. |
 | `make experiment-leg` | Single `(CONV, MODE)` × backends. Knobs: `CONV MODE BACKENDS QUESTIONS MESSAGES Q_PER_TYPE QUESTION_TYPES KEEP_STATE`. |
 | `make logs` / `ps`    | Tail logs / list containers.                                                                 |
 
+## Network partition
+
+Three compose bridges with a single gateway:
+
+- `edge-net` — `coordinator`, `ollama`, `litellm-edge`
+- `cloud-net` — `responder`, `memory`, `qdrant`, `neo4j`, `litellm-cloud`
+- `mgmt-net` — `benchmark`, `langfuse-*` (observability + orchestration, never on the data plane)
+
+`toxiproxy` is the sole container with a foot in both data subnets. Coordinator is the only caller that goes through it; responder↔memory and memory↔storage are direct on `cloud-net`.
+
+`make build` auto-picks a non-colliding /16 from a candidate list (172.30, 172.40, 10.42, 192.168.220, …) and pins the chosen subnets + toxiproxy IPs into `.env`. Pin manually by uncommenting the block in `.env.example`.
+
 ## Network fault injection
 
-Toxiproxy sits in front of `memory` and `responder`. The benchmark verifies the requested toxics against the live proxy state and rejects with HTTP 412 on mismatch (`dmas/benchmark/app/toxics.py`).
+`unconstrained` clears all toxics; `constrained` applies `CONSTRAINED_LATENCY` / `CONSTRAINED_JITTER` / `CONSTRAINED_BANDWIDTH` (defaults 150 ms / 30 ms / 512 KB/s) to toxiproxy's memory + responder proxies — i.e. only the coordinator↔cloud flows. The bench re-verifies live toxic state mid-run and rejects with HTTP 412 on drift (`dmas/benchmark/app/toxics.py`).
 
-Two regimes: `unconstrained` clears all toxics; `constrained` applies `CONSTRAINED_LATENCY` / `CONSTRAINED_JITTER` / `CONSTRAINED_BANDWIDTH` (defaults 150 ms / 30 ms / 512 KB/s).
+## Network metering
+
+Cross-boundary traffic is read at toxiproxy's `edge-net` veth: rx_bytes = edge→cloud (`network_edge_to_cloud_bytes`), tx_bytes = cloud→edge (`network_cloud_to_edge_bytes`). One chokepoint, no double-count, no intra-cloud inflation. CPU/RAM/disk are still summed per `group=edge|cloud` label (`dmas/benchmark/app/cgroup_metrics.py`).
 
 ## Project structure
 
@@ -73,7 +87,7 @@ dmas-memory/
     │   ├── memory/           # mem0 + Graphiti + Cognee + RAG + FullContext
     │   ├── responder/        # Final-answer generator
     │   ├── shared/           # otel_init.py, litellm_usage.py, models.py
-    │   ├── litellm/config.yaml
+    │   ├── litellm/{config-edge,config-cloud}.yaml
     │   └── docker-compose.yml
     ├── experiments/
     │   ├── results.ipynb     # Reproduces every table and chart in the paper

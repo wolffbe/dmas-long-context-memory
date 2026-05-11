@@ -168,6 +168,11 @@ def _toxics_for(mode: str) -> tuple[float, float, float]:
     # `mode` is constrained by ExperimentRequest's validator, so the
     # branches are exhaustive — no silent (0,0,0) fallback for unexpected
     # values, which would otherwise mask validator regressions.
+    # The constrained profile shapes ONLY the edge↔cloud boundary:
+    # coordinator → toxiproxy → {memory, responder}. Intra-cloud flows
+    # (responder↔memory, memory↔qdrant/neo4j) go direct on cloud-net and
+    # are never subject to these toxics, matching the "responder + memory
+    # + storage = one logical unit" semantics of the partition.
     if mode == "constrained":
         return CONSTRAINED_LATENCY, CONSTRAINED_JITTER, CONSTRAINED_BANDWIDTH
     if mode == "unconstrained":

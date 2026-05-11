@@ -61,7 +61,6 @@ build: _check_docker _bootstrap_env_file _refresh_public_url _check_openai
 # generates the langfuse pk/sk + OTel basic-auth header into .env on
 # first run; langfuse v3 picks them up via LANGFUSE_INIT_PROJECT_*.
 start: _check_docker _bootstrap_env_file _check_openai
-	@docker network create dmas-network 2>/dev/null || true
 	@echo "==> starting full dmas stack"
 	docker compose --env-file .env -f $(DMAS_COMPOSE) up -d --remove-orphans
 	@$(MAKE) _wait_benchmark
@@ -71,20 +70,21 @@ start: _check_docker _bootstrap_env_file _check_openai
 stop:
 	docker compose --env-file .env -f $(DMAS_COMPOSE) down --remove-orphans || true
 
-# Wipe ONLY memory backend state (qdrant + neo4j). Langfuse history,
-# ollama models, and the dmas-network are kept intact — handy for
-# re-running calibration against a fresh memory but skipping the
-# 5-min ollama pull and the langfuse account setup.
+# Wipe ONLY memory backend state (qdrant + neo4j). Langfuse history
+# and ollama models are kept intact — handy for re-running calibration
+# against a fresh memory but skipping the 5-min ollama pull and the
+# langfuse account setup. Compose-managed networks survive `stop` and
+# are reused on the next `start`.
 clean: stop
 	@echo "==> dropping memory volumes: $(MEMORY_VOLUMES)"
 	docker volume rm $(MEMORY_VOLUMES) 2>/dev/null || true
 
-# Wipe everything: every named volume + the dmas-network. Next `make
-# setup` starts from a blank slate.
+# Wipe everything: every named volume. The three compose-managed
+# networks (edge-net, cloud-net, mgmt-net) are torn down by `compose
+# down` in `stop` and re-created on the next `start`.
 reset: stop
 	@echo "==> dropping all volumes: $(ALL_VOLUMES)"
 	docker volume rm $(ALL_VOLUMES) 2>/dev/null || true
-	docker network rm dmas-network 2>/dev/null || true
 
 # === checks ==============================================================
 
@@ -161,6 +161,51 @@ _bootstrap_env_file:
 	grep -v '^LANGFUSE_OTEL_BASIC_AUTH=' .env > .env.tmp; mv .env.tmp .env; \
 	echo "LANGFUSE_OTEL_BASIC_AUTH=$$AUTH" >> .env; \
 	echo "==> wrote LANGFUSE_OTEL_BASIC_AUTH (litellm OTel exporter)"
+	@# === pick non-colliding subnets =====================================
+	@# Runs only when ANY of the five subnet/IP vars is missing — once
+	@# all five are written the picker leaves them alone, so a running
+	@# deployment never silently moves to a different /16 mid-life. The
+	@# search compares each candidate /16's first three /24s against
+	@# (a) every existing Docker network's IPAM subnet and (b) the
+	@# host's IPv4 route table. `ip` is best-effort: on Git Bash /
+	@# Docker Desktop where iproute2 is absent the host-route check
+	@# degrades to empty, so picker relies solely on Docker state.
+	@if ! grep -qE '^EDGE_NET_SUBNET=.+' .env \
+		|| ! grep -qE '^EDGE_NET_TOXIPROXY_IP=.+' .env \
+		|| ! grep -qE '^CLOUD_NET_SUBNET=.+' .env \
+		|| ! grep -qE '^CLOUD_NET_TOXIPROXY_IP=.+' .env \
+		|| ! grep -qE '^MGMT_NET_SUBNET=.+' .env; then \
+		echo "==> picking non-colliding subnets"; \
+		docker_subnets=$$(docker network ls -q 2>/dev/null | while read net; do \
+			docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' $$net 2>/dev/null; \
+		done); \
+		host_routes=$$(ip -4 route show 2>/dev/null | awk '{print $$1}' | grep -E '^[0-9]' || true); \
+		chosen=""; \
+		for base in 172.30 172.40 172.50 172.60 172.70 10.42 10.52 10.62 192.168.220 192.168.230; do \
+			collision=false; \
+			if echo "$$docker_subnets" | grep -qE "(^| )$$base\." \
+				|| echo "$$host_routes" | grep -qE "(^| )$$base\."; then \
+				collision=true; \
+			fi; \
+			if [ "$$collision" = "false" ]; then chosen=$$base; break; fi; \
+		done; \
+		if [ -z "$$chosen" ]; then \
+			echo "ERROR: every candidate /16 collides with an existing"; \
+			echo "       Docker network or host route. Pin EDGE_NET_SUBNET"; \
+			echo "       etc. manually in .env to a known-free range."; \
+			exit 1; \
+		fi; \
+		echo "==> chose $$chosen.0.0/16 (edge=$$chosen.1.0/24 cloud=$$chosen.2.0/24 mgmt=$$chosen.3.0/24)"; \
+		grep -v -E '^(EDGE_NET_SUBNET|EDGE_NET_TOXIPROXY_IP|CLOUD_NET_SUBNET|CLOUD_NET_TOXIPROXY_IP|MGMT_NET_SUBNET)=' .env > .env.tmp; \
+		mv .env.tmp .env; \
+		{ \
+			echo "EDGE_NET_SUBNET=$$chosen.1.0/24"; \
+			echo "EDGE_NET_TOXIPROXY_IP=$$chosen.1.10"; \
+			echo "CLOUD_NET_SUBNET=$$chosen.2.0/24"; \
+			echo "CLOUD_NET_TOXIPROXY_IP=$$chosen.2.10"; \
+			echo "MGMT_NET_SUBNET=$$chosen.3.0/24"; \
+		} >> .env; \
+	fi
 
 # Force-refresh LANGFUSE_PUBLIC_URL from EC2 metadata. Runs in addition
 # to the IP block inside _bootstrap_env_file so `make build` always

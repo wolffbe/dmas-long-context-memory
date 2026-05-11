@@ -17,8 +17,13 @@ from fastapi import HTTPException
 
 
 PROXY_SPECS: tuple[tuple[str, str, str], ...] = (
-    # (name, listen, upstream) — listen is on toxiproxy:1800X, upstream is the
-    # internal service host:port on dmas-network.
+    # (name, listen, upstream) — listen is on toxiproxy:1800X (edge-net
+    # side), upstream is the in-cloud service:port reachable from
+    # toxiproxy's cloud-net foot. Only coordinator (edge-net) is supposed
+    # to hit these proxies; responder→memory and memory→storage are now
+    # direct intra-cloud calls and never touch toxiproxy, so the
+    # constrained latency/jitter/bandwidth scope here is precisely the
+    # edge↔cloud boundary.
     ("memory", "0.0.0.0:18005", "memory:8002"),
     ("responder", "0.0.0.0:18006", "responder:8003"),
 )
