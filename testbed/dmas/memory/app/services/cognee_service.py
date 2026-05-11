@@ -19,10 +19,11 @@ import cognee
 from cognee.api.v1.search import SearchType
 
 # Side-effect import: registers the qdrant vector adapter with cognee.
-# cognee 0.5.x ships only LanceDB/PGVector/Chroma in core; qdrant lives
-# in the cognee-community adapter package and must be imported BEFORE
-# any cognee call that resolves the vector backend, otherwise cognee
-# raises "Unsupported vector database provider: qdrant".
+# Qdrant lives in the cognee-community adapter package and must be
+# imported BEFORE any cognee call that resolves the vector backend,
+# otherwise cognee raises "Unsupported vector database provider: qdrant".
+# The adapter's PyPI metadata pins `cognee==0.5.6` but its runtime works
+# against 1.0.x — we install it with `--no-deps` in the Dockerfile.
 import cognee_community_vector_adapter_qdrant.register  # noqa: F401
 
 from shared.errors import exc_trace
@@ -39,11 +40,12 @@ class CogneeService:
     knowledge graph in Neo4j with embeddings in Qdrant; `search` returns
     graph-completion context.
 
-    Pinned to cognee 0.5.6 (V1 add/cognify/search API) so we can keep
-    qdrant as the vector store via the cognee-community adapter — cognee
-    1.0+ has the new remember/recall/forget/improve API, but no published
-    qdrant adapter version is compatible with 1.0.x. Qdrant parity with
-    rag/mem0 was the constraint that forced this version pin.
+    Running cognee 1.0.x with the V1 `add/cognify/search` API, which
+    1.0 keeps as lower-level building blocks alongside the newer
+    `remember/recall/forget/improve` surface. The cognee-community
+    qdrant adapter still advertises itself for 0.5.6 only, but its
+    runtime code works against 1.0.x — see Dockerfile for the
+    `--no-deps` install that bypasses the bogus pin.
 
     Note on canonical-eval fidelity: unlike mem0 (mirrors
     mem0ai/memory-benchmarks) and graphiti (mirrors getzep/zep-papers
@@ -76,15 +78,15 @@ class CogneeService:
         # gpt-4o-mini and text-embedding-3-small@1536 routed through the
         # same litellm proxy that responder/judge/mem0/graphiti/rag use,
         # so extraction-time LLM and embedding cost are directly
-        # comparable across backends. cognee 0.5.6 caches config at first
-        # use, so set everything explicitly here rather than relying on
+        # comparable across backends. cognee caches config at first use,
+        # so set everything explicitly here rather than relying on
         # process env (which cognee may have already snapshotted).
         cognee.config.set_llm_provider("openai")
         cognee.config.set_llm_model(os.getenv("LLM_MODEL", "gpt-4o-mini"))
         cognee.config.set_llm_api_key(os.getenv("OPENAI_API_KEY", ""))
-        # cognee 0.5.6 defaults llm_temperature to 0, but pin it
-        # explicitly so it can't drift if a future config layer changes
-        # the default. Mirrors the temperature=0 contract used at every
+        # cognee defaults llm_temperature to 0, but pin it explicitly so
+        # it can't drift if a future config layer changes the default.
+        # Mirrors the temperature=0 contract used at every
         # other LLM call site (responder, coordinator, judge, mem0,
         # graphiti).
         cognee.config.set_llm_config({"llm_temperature": 0})

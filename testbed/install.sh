@@ -12,7 +12,7 @@
 set -eu
 
 # Pinned Docker versions for reproducibility. Bump these to upgrade.
-DOCKER_ENGINE_VERSION="27.5.1"     # apt-based Linux (docker-ce / docker-ce-cli)
+DOCKER_ENGINE_VERSION="29.4.3"     # apt-based Linux (docker-ce / docker-ce-cli)
 DOCKER_DESKTOP_VERSION="4.37.2"    # Windows winget (Docker.DockerDesktop)
 
 DOCKER_GROUP_ADDED=0

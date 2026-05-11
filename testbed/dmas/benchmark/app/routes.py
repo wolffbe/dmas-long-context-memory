@@ -97,7 +97,7 @@ class ExperimentRequest(BaseModel):
 
     `mode` selects the network regime:
       - "unconstrained": toxiproxy cleared (lat=0, jit=0, bw=0)
-      - "constrained":   toxiproxy set to CONSTRAINED_* (defaults: 100/20/512)
+      - "constrained":   toxiproxy set to CONSTRAINED_* (defaults: 150/30/512)
 
     For each backend we wipe memory state, apply toxics, load the conv
     (one /memorize call per message), run the Q&A loop ONCE per question,

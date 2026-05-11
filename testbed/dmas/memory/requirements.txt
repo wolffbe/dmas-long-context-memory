@@ -1,23 +1,35 @@
 fastapi==0.116.2
 uvicorn==0.34.0
-pydantic==2.12.3
-openai==2.6.1
-httpx==0.27.0
-mem0ai==2.0.1
+pydantic==2.12.5
+openai==2.24.0
+httpx==0.28.1
+mem0ai==2.0.2
 graphiti-core==0.29.0
-cognee==0.5.6
-cognee-community-vector-adapter-qdrant==0.2.4
-# cognee 0.5.6 lazily imports `langfuse` from its observability layer.
-# Without it the import raises ModuleNotFoundError mid-pipeline and the
-# error bubbles up into the benchmark CSV. We don't use langfuse's SDK
-# directly (we ship traces via OTel/OTLP), but cognee needs the module
-# present at import time, so pin a compatible release.
+cognee==1.0.9
+# cognee 1.0.x lazy-imports `from langfuse.decorators import observe` inside
+# `cognee/modules/observability/get_observe.py`. langfuse isn't declared in
+# cognee's deps, but the import fires on the first cognify and raises
+# ModuleNotFoundError mid-pipeline, which surfaces as per-row errors in the
+# benchmark CSV. We ship traces via OTel/OTLP rather than the langfuse SDK,
+# so any 2.x release with `langfuse.decorators` is enough. langfuse 3.x
+# rewrote the SDK and dropped `decorators`, so don't auto-bump.
 langfuse==2.60.0
-qdrant-client==1.10.0
+# cognee 1.0.9 declares `instructor<2.0.0,>=1.9.1`, and pip happily resolves
+# to 1.9.1 — which pins `openai<2.0.0`, fighting our openai 2.x pin.
+# instructor 1.13+ relaxed that to `openai<3.0,>=2.0`, so force a version
+# inside cognee's range that lets openai 2.x land.
+instructor==1.15.1
+# cognee-community-vector-adapter-qdrant 0.2.4 hard-pins `cognee==0.5.6`
+# in its own metadata, but its runtime code works against cognee 1.0.x.
+# Install it via the Dockerfile with `pip install --no-deps` so the bogus
+# pin doesn't unwind our cognee bump. Until the adapter publishes a 1.0-
+# compatible release, this is the only way to keep qdrant parity with
+# rag/mem0 on cognee 1.0+.
+qdrant-client==1.17.1
 python-dotenv==1.0.1
-opentelemetry-api==1.27.0
-opentelemetry-sdk==1.27.0
-opentelemetry-exporter-otlp-proto-http==1.27.0
-opentelemetry-instrumentation-fastapi==0.48b0
-opentelemetry-instrumentation-httpx==0.48b0
-opentelemetry-instrumentation-requests==0.48b0
+opentelemetry-api==1.41.1
+opentelemetry-sdk==1.41.1
+opentelemetry-exporter-otlp-proto-http==1.41.1
+opentelemetry-instrumentation-fastapi==0.62b1
+opentelemetry-instrumentation-httpx==0.62b1
+opentelemetry-instrumentation-requests==0.62b1

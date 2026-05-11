@@ -229,10 +229,10 @@ experiment-leg:
 	@if [ -z "$(CONV)" ]; then echo "CONV is required — pass CONV=<i>"; exit 2; fi
 	@case "$(MODE)" in unconstrained|constrained) ;; *) \
 		echo "MODE must be unconstrained|constrained — got '$(MODE)'"; exit 2 ;; esac
-	@LOG_PID=""; \
-	trap 'kill $$LOG_PID 2>/dev/null; wait $$LOG_PID 2>/dev/null; true' EXIT INT TERM; \
+	@set -m; LOG_PID=""; \
+	trap 'kill -- -$$LOG_PID 2>/dev/null; wait $$LOG_PID 2>/dev/null; true' EXIT INT TERM; \
 	( docker compose --env-file .env -f $(DMAS_COMPOSE) logs -f --tail=0 memory benchmark 2>&1 \
-		| grep -E --line-buffered '\[(mem0|graphiti) load\]|\[load\]|\[exp\] ' \
+		| grep -E --line-buffered '\[(mem0|graphiti|cognee|rag) load\]|FullContext append|\[load\]|\[exp\] ' \
 		| sed -u 's/^/[svc] /' ) & LOG_PID=$$!; \
 	sleep 0.3; \
 	extras=""; \
