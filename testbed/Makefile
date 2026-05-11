@@ -6,7 +6,14 @@
 PY ?= python3
 
 # Knobs for experiment / experiment-test.
-MODE           ?= unconstrained
+# MODE: experiment-leg consumes a single value (defaults to unconstrained
+# when unset). The sweep targets (experiment, experiment-test,
+# experiment-test-s, experiment-test-l) accept a space-separated list and
+# default to both regimes when unset. Examples:
+#   make experiment-leg CONV=0 MODE=constrained
+#   make experiment MODE=unconstrained
+#   make experiment MODE="unconstrained constrained"
+MODE           ?=
 BACKENDS       ?= mem0 graphiti rag cognee full_context
 LLM_AS_JUDGE_SEED ?= 3
 MESSAGES       ?= $(LOAD_LIMIT)
@@ -227,9 +234,10 @@ _wait_benchmark:
 #   make experiment-leg CONV=0 MESSAGES=20 QUESTIONS=1   # load 20 msgs, ask 1 q
 experiment-leg:
 	@if [ -z "$(CONV)" ]; then echo "CONV is required — pass CONV=<i>"; exit 2; fi
-	@case "$(MODE)" in unconstrained|constrained) ;; *) \
-		echo "MODE must be unconstrained|constrained — got '$(MODE)'"; exit 2 ;; esac
-	@set -m; LOG_PID=""; \
+	@MODE_VAL="$(or $(MODE),unconstrained)"; \
+	case "$$MODE_VAL" in unconstrained|constrained) ;; *) \
+		echo "MODE must be a single value (unconstrained|constrained) — got '$$MODE_VAL'"; exit 2 ;; esac; \
+	set -m; LOG_PID=""; \
 	trap 'kill -- -$$LOG_PID 2>/dev/null; wait $$LOG_PID 2>/dev/null; true' EXIT INT TERM; \
 	( docker compose --env-file .env -f $(DMAS_COMPOSE) logs -f --tail=0 memory benchmark 2>&1 \
 		| grep -E --line-buffered '\[(mem0|graphiti|cognee|rag) load\]|FullContext append|\[load\]|\[exp\] ' \
@@ -247,7 +255,7 @@ experiment-leg:
 	if [ -n "$(NAME_PREFIX)" ]; then extras="$$extras,\"name_prefix\":\"$(NAME_PREFIX)\""; fi; \
 	backends_json=$$(printf '"%s",' $(BACKENDS) | sed 's/,$$//'); \
 	body=$$(printf '{"conv":%s,"mode":"%s","llm_as_judge_seed":%s,"backends":[%s]%s}' \
-		"$(CONV)" "$(MODE)" "$(LLM_AS_JUDGE_SEED)" "$$backends_json" "$$extras"); \
+		"$(CONV)" "$$MODE_VAL" "$(LLM_AS_JUDGE_SEED)" "$$backends_json" "$$extras"); \
 	echo "==> POST $(BENCHMARK_URL)/experiment  body=$$body"; \
 	curl -fsSN -X POST "$(BENCHMARK_URL)/experiment" \
 		-H "Content-Type: application/json" \
@@ -272,7 +280,10 @@ TEST_NAME_PREFIX        ?= test_
 TEST_LLM_AS_JUDGE_SEED  ?= 1
 experiment-test:
 	@if [ -z "$(CONV)" ]; then echo "CONV is required — pass CONV=<i>"; exit 2; fi
-	@for mode in unconstrained constrained; do \
+	@MODE_LIST="$(or $(MODE),unconstrained constrained)"; \
+	for mode in $$MODE_LIST; do \
+		case "$$mode" in unconstrained|constrained) ;; *) \
+			echo "MODE values must be unconstrained|constrained — got '$$mode'"; exit 2 ;; esac; \
 		echo "==> smoke $$mode leg (CONV=$(CONV) BACKENDS='$(BACKENDS)' LLM_AS_JUDGE_SEED=$(TEST_LLM_AS_JUDGE_SEED))"; \
 		$(MAKE) experiment-leg \
 			CONV=$(CONV) MODE=$$mode LLM_AS_JUDGE_SEED=$(TEST_LLM_AS_JUDGE_SEED) \
@@ -284,19 +295,25 @@ experiment-test:
 			BACKENDS="$(BACKENDS)" || exit $$?; \
 	done
 
-# Full publishable sweep: every CONV in CONVS × {unconstrained,
-# constrained} × every backend in BACKENDS. Each (conv, mode) leg wipes
-# memory state at the start, loads the conversation in full, asks every
-# question once, and lets the LLM-as-judge panel run LLM_AS_JUDGE_SEED
-# times per answer (default 3, majority-vote). No KEEP_STATE — every
-# leg starts on clean state. Override CONVS or BACKENDS to narrow:
+# Full publishable sweep: every CONV in CONVS × every mode in MODE ×
+# every backend in BACKENDS. MODE defaults to both regimes
+# (unconstrained constrained) when unset; pass a single value to narrow.
+# Each (conv, mode) leg wipes memory state at the start, loads the
+# conversation in full, asks every question once, and lets the
+# LLM-as-judge panel run LLM_AS_JUDGE_SEED times per answer (default 3,
+# majority-vote). No KEEP_STATE — every leg starts on clean state.
+# Override CONVS, MODE, or BACKENDS to narrow:
 #   make experiment
 #   make experiment BACKENDS="mem0 graphiti"
 #   make experiment CONVS="0 5"
+#   make experiment MODE=unconstrained
 #   make experiment LLM_AS_JUDGE_SEED=5
 experiment:
-	@for conv in $(CONVS); do \
-		for mode in unconstrained constrained; do \
+	@MODE_LIST="$(or $(MODE),unconstrained constrained)"; \
+	for conv in $(CONVS); do \
+		for mode in $$MODE_LIST; do \
+			case "$$mode" in unconstrained|constrained) ;; *) \
+				echo "MODE values must be unconstrained|constrained — got '$$mode'"; exit 2 ;; esac; \
 			echo "==> experiment leg conv=$$conv mode=$$mode (BACKENDS='$(BACKENDS)' LLM_AS_JUDGE_SEED=$(LLM_AS_JUDGE_SEED))"; \
 			$(MAKE) experiment-leg \
 				CONV=$$conv MODE=$$mode \
@@ -324,7 +341,10 @@ TEST_S_LLM_AS_JUDGE_SEED ?= 1
 experiment-test-s:
 	@CONV_VAL="$(or $(CONV),$(TEST_S_CONV))"; \
 	SEED="$(if $(filter command,$(origin LLM_AS_JUDGE_SEED)),$(LLM_AS_JUDGE_SEED),$(TEST_S_LLM_AS_JUDGE_SEED))"; \
-	for mode in unconstrained constrained; do \
+	MODE_LIST="$(or $(MODE),unconstrained constrained)"; \
+	for mode in $$MODE_LIST; do \
+		case "$$mode" in unconstrained|constrained) ;; *) \
+			echo "MODE values must be unconstrained|constrained — got '$$mode'"; exit 2 ;; esac; \
 		echo "==> smoke-S $$mode leg (CONV=$$CONV_VAL BACKENDS='$(BACKENDS)' MESSAGES=$(TEST_S_MESSAGES) QT=$(TEST_S_QUESTION_TYPES) Q_PER_TYPE=$(TEST_S_Q_PER_TYPE) LLM_AS_JUDGE_SEED=$$SEED)"; \
 		$(MAKE) experiment-leg \
 			CONV=$$CONV_VAL MODE=$$mode \
@@ -353,7 +373,10 @@ TEST_L_LLM_AS_JUDGE_SEED ?= 1
 experiment-test-l:
 	@CONV_VAL="$(or $(CONV),$(TEST_L_CONV))"; \
 	SEED="$(if $(filter command,$(origin LLM_AS_JUDGE_SEED)),$(LLM_AS_JUDGE_SEED),$(TEST_L_LLM_AS_JUDGE_SEED))"; \
-	for mode in unconstrained constrained; do \
+	MODE_LIST="$(or $(MODE),unconstrained constrained)"; \
+	for mode in $$MODE_LIST; do \
+		case "$$mode" in unconstrained|constrained) ;; *) \
+			echo "MODE values must be unconstrained|constrained — got '$$mode'"; exit 2 ;; esac; \
 		echo "==> smoke-L $$mode leg (CONV=$$CONV_VAL BACKENDS='$(BACKENDS)' MESSAGES=$(TEST_L_MESSAGES) QT=$(TEST_L_QUESTION_TYPES) Q_PER_TYPE=$(TEST_L_Q_PER_TYPE) LLM_AS_JUDGE_SEED=$$SEED)"; \
 		$(MAKE) experiment-leg \
 			CONV=$$CONV_VAL MODE=$$mode \
