@@ -42,7 +42,12 @@ litellm_settings:
   # is still honoured per-deployment.
   num_retries: 1470
   retry_after: 0
-  request_timeout: 600
+  # Was 600 (10 min). A hung OpenAI socket (TCP ESTABLISHED, no bytes)
+  # doesn't surface as a failure until this expires, so a single stalled
+  # request parks the episode for up to 10 min before ping-pong kicks
+  # in. 120s is generous for gpt-4o-mini chat/embeddings and lets the
+  # router rotate to the backup key promptly on real hangs.
+  request_timeout: 120
 
 router_settings:
   cooldown_time: 0
