@@ -282,6 +282,28 @@ experiment-leg:
 	@MODE_VAL="$(or $(MODE),unconstrained)"; \
 	case "$$MODE_VAL" in unconstrained|constrained) ;; *) \
 		echo "MODE must be a single value (unconstrained|constrained) — got '$$MODE_VAL'"; exit 2 ;; esac; \
+	prefix="$(NAME_PREFIX)"; \
+	conflict=""; \
+	for backend in $(BACKENDS); do \
+		csv="experiments/results/$${prefix}$${backend}_$${MODE_VAL}.csv"; \
+		if [ -f "$$csv" ] && awk -F',' \
+			'NR==1{for(i=1;i<=NF;i++)if($$i=="conversation_index")col=i} \
+			 NR>1&&col&&$$col=="$(CONV)"{found=1;exit} \
+			 END{exit !found}' "$$csv" 2>/dev/null; then \
+			conflict="$$conflict $$csv"; \
+		fi; \
+	done; \
+	if [ -n "$$conflict" ]; then \
+		if [ -n "$(FORCE)" ]; then \
+			echo "WARNING: conv=$(CONV) already in:$$conflict  Proceeding (FORCE=1)."; \
+		else \
+			echo "ERROR: conv=$(CONV) already in:"; \
+			for f in $$conflict; do echo "  $$f"; done; \
+			echo "  Delete those files or pass FORCE=1 to proceed."; \
+			exit 1; \
+		fi; \
+	fi
+	@MODE_VAL="$(or $(MODE),unconstrained)"; \
 	set -m; LOG_PID=""; \
 	trap 'kill -- -$$LOG_PID 2>/dev/null; wait $$LOG_PID 2>/dev/null; true' EXIT INT TERM; \
 	( docker compose --env-file .env -f $(DMAS_COMPOSE) logs -f --tail=0 memory benchmark 2>&1 \
@@ -337,6 +359,7 @@ experiment-test:
 			Q_PER_TYPE=$(TEST_Q_PER_TYPE) \
 			KEEP_STATE=1 \
 			NAME_PREFIX=$(TEST_NAME_PREFIX) \
+			FORCE=1 \
 			BACKENDS="$(BACKENDS)" || exit $$?; \
 	done
 
@@ -399,6 +422,7 @@ experiment-test-s:
 			Q_PER_TYPE=$(TEST_S_Q_PER_TYPE) \
 			KEEP_STATE=1 \
 			NAME_PREFIX=$(TEST_S_NAME_PREFIX) \
+			FORCE=1 \
 			BACKENDS="$(BACKENDS)" || exit $$?; \
 	done
 

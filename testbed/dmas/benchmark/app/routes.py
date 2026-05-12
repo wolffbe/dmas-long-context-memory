@@ -48,9 +48,9 @@ from opentelemetry.trace import format_trace_id
 from app.agents import post_ask, post_memorize, post_reset, post_warmup
 from app.judges import judge_majority
 from app.locomo_service import LocomoService
-from app.results import RESULTS_DIR, already_done, append_row, loaded_messages
+from app.results import RESULTS_DIR, already_done, append_row, loaded_messages, file_for_config
 from shared.litellm_usage import usage_snapshot_async as litellm_usage_snapshot, diff as litellm_usage_diff
-from app.cgroup_metrics import snapshot as cgroup_snapshot, delta as cgroup_delta, wait_io_quiet as cgroup_wait_io_quiet
+from app.cgroup_metrics import snapshot as cgroup_snapshot, delta as cgroup_delta, wait_io_quiet as cgroup_wait_io_quiet, reset_peaks as cgroup_reset_peaks
 from app.toxics import apply_all, verify_all
 
 _tracer = otel_trace.get_tracer(__name__)
@@ -683,6 +683,14 @@ async def experiment(req: ExperimentRequest, request: Request):
                     yield json.dumps({"_phase": "reset_error", "when": "pre",
                                       "backend": backend, "error": str(exc)[:300]}) + "\n"
                     continue
+
+                # Reset memory.peak at the start of the constrained scenario
+                # so its peak is measured independently of the unconstrained
+                # run that preceded it on the same containers.
+                constrained_csv = file_for_config(backend, latency, jitter, bandwidth,
+                                                  req.name_prefix)
+                if latency > 0 and not constrained_csv.exists():
+                    await cgroup_reset_peaks()
 
                 # Warmup — pay one-time backend init (graphiti index build,
                 # qdrant collection create) up front so it gets its own row

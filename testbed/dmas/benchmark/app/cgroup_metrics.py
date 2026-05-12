@@ -129,14 +129,28 @@ def _read_mem(scope: Path) -> int:
 
 
 def _read_mem_peak(scope: Path) -> int:
-    """memory.peak is the high-water mark since the cgroup was created.
-    Diffing two snapshots gives the *additional* peak attributable to the
-    interval between them — i.e., the most RAM the cgroup needed to hold
-    while the call was in flight, in excess of any prior peak."""
+    """Read memory.peak: the monotonic high-water mark since container start
+    (or last reset). Returns 0 on any read failure."""
     try:
         return int((scope / "memory.peak").read_text().strip())
     except (FileNotFoundError, PermissionError, ValueError):
         return 0
+
+
+async def reset_peaks() -> None:
+    """Reset memory.peak to the current RSS for all labeled containers.
+    Writing to memory.peak resets the kernel's high-water mark to the
+    current memory.current value (Linux ≥ 5.19). Call once at the start
+    of each experiment leg so the t1-t0 peak delta reflects only the RAM
+    allocated during that leg, regardless of prior container history."""
+    if not _label_cache:
+        return
+    for cid in _label_cache:
+        scope = CGROUP_ROOT / "system.slice" / f"docker-{cid}.scope"
+        try:
+            (scope / "memory.peak").write_text("0\n")
+        except (FileNotFoundError, PermissionError, OSError):
+            pass
 
 
 def _read_io(scope: Path) -> tuple[int, int]:

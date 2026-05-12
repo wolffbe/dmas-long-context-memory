@@ -330,7 +330,7 @@ services:
       - LANGFUSE_PROJECT_ID=${LANGFUSE_PROJECT_ID:-dmas}
     volumes:
       - ../experiments/results:/results
-      - /sys/fs/cgroup:/host-cgroup:ro
+      - /sys/fs/cgroup:/host-cgroup:rw
       - /proc:/host-proc:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
