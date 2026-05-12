@@ -28,6 +28,7 @@ import cognee_community_vector_adapter_qdrant.register  # noqa: F401
 
 from shared.errors import exc_trace
 from shared.litellm_usage import usage_snapshot_sync as usage_snapshot, diff as usage_diff
+from shared.openai_warmup import warmup_chat_async
 from app.services.mem0_service import parse_locomo_date
 
 logger = logging.getLogger(__name__)
@@ -140,15 +141,18 @@ class CogneeService:
             logger.debug("cognee awaitIndexes skipped", exc_info=True)
 
     async def warmup_async(self, conv_index: int) -> Dict[str, Any]:
-        """No-op cognify on an empty dataset to pay any one-time
-        Neo4j-schema / Qdrant-collection setup cost up front."""
+        """Pay cognee's one-time setup costs up front: dataset-metadata
+        rows, Neo4j schema, Qdrant collection, and a litellm chat ping so
+        row #1 of the load loop doesn't pay the cold OpenAI handshake."""
         dataset = self._dataset_for(conv_index)
         try:
-            # Touch the dataset so cognee's relational metadata store
-            # creates its rows; subsequent /memorize calls skip this.
             await cognee.add("warmup", dataset_name=dataset)
         except Exception:
             logger.exception("cognee warmup add failed")
+        try:
+            await warmup_chat_async()
+        except Exception:
+            logger.exception("cognee warmup chat.completions failed")
         return {"backend": "cognee", "warmed": True, "dataset": dataset}
 
     async def memorize_iter_async(self, conv_index: int, data: Dict[str, Any]):

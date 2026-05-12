@@ -15,6 +15,7 @@ from mem0.configs.base import MemoryConfig
 
 from shared.errors import exc_trace
 from shared.litellm_usage import usage_snapshot_sync as usage_snapshot, diff as usage_diff
+from shared.openai_warmup import warmup_chat_sync
 
 logger = logging.getLogger(__name__)
 
@@ -291,9 +292,9 @@ class Mem0Service:
         return summary
 
     def warmup(self, conv_index: int) -> Dict[str, Any]:
-        """Trigger a no-op search so the Qdrant client establishes its
-        connection / loads its collection metadata, paying that cost up
-        front instead of folding it into row #1."""
+        """Pay mem0's one-time setup costs up front: Qdrant client
+        connect + collection-metadata load, then a litellm chat ping so
+        row #1 of the load loop doesn't pay the cold OpenAI handshake."""
         try:
             # mem0 v2 moved entity scoping into `filters=`; passing
             # user_id at the top level now raises ValueError.
@@ -304,6 +305,10 @@ class Mem0Service:
             )
         except Exception:
             logger.exception("mem0 warmup search failed")
+        try:
+            warmup_chat_sync()
+        except Exception:
+            logger.exception("mem0 warmup chat.completions failed")
         return {"backend": "mem0", "warmed": True}
 
     def reset(self) -> Dict[str, Any]:

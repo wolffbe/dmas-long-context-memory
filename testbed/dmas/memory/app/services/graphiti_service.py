@@ -19,6 +19,7 @@ from graphiti_core.search.search_config_recipes import (
 
 from shared.errors import exc_trace
 from shared.litellm_usage import usage_snapshot_sync as usage_snapshot, diff as usage_diff
+from shared.openai_warmup import warmup_responses_async
 from app.services.mem0_service import parse_locomo_date
 
 logger = logging.getLogger(__name__)
@@ -101,8 +102,9 @@ class GraphitiService:
                 logger.exception("Failed to initialize Graphiti indices: %s", e)
 
     async def warmup_async(self, conv_index: int) -> Dict[str, Any]:
-        """Pay the one-time index/constraint build cost up front so it
-        doesn't spike row #1 of the load loop."""
+        """Pay graphiti's one-time setup costs up front: Neo4j index +
+        constraint build, then a litellm responses.parse ping so row #1
+        of the load loop doesn't pay the cold OpenAI handshake."""
         await self._initialize()
         try:
             await self.graphiti.driver.execute_query(
@@ -111,6 +113,10 @@ class GraphitiService:
             )
         except Exception:
             logger.exception("warmup awaitIndexes failed")
+        try:
+            await warmup_responses_async()
+        except Exception:
+            logger.exception("graphiti warmup responses.parse failed")
         return {"backend": "graphiti", "warmed": True}
 
     async def memorize_iter_async(self, conv_index: int, data: Dict[str, Any]):
