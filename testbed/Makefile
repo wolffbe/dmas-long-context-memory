@@ -79,12 +79,18 @@ clean: stop
 	@echo "==> dropping memory volumes: $(MEMORY_VOLUMES)"
 	docker volume rm $(MEMORY_VOLUMES) 2>/dev/null || true
 
-# Wipe everything: every named volume. The three compose-managed
-# networks (edge-net, cloud-net, mgmt-net) are torn down by `compose
-# down` in `stop` and re-created on the next `start`.
+# Wipe everything: every named volume, plus top-level *.log files and any
+# files under experiments/results/ that aren't tucked away in backup/. The
+# three compose-managed networks (edge-net, cloud-net, mgmt-net) are torn
+# down by `compose down` in `stop` and re-created on the next `start`.
+# Move anything worth keeping into experiments/results/backup/ before running.
 reset: stop
 	@echo "==> dropping all volumes: $(ALL_VOLUMES)"
 	docker volume rm $(ALL_VOLUMES) 2>/dev/null || true
+	@echo "==> removing top-level *.log"
+	rm -f *.log
+	@echo "==> removing experiments/results/* except backup/"
+	find experiments/results -mindepth 1 -maxdepth 1 ! -name backup -exec rm -rf {} +
 
 # === checks ==============================================================
 
@@ -304,8 +310,8 @@ experiment-leg:
 		fi; \
 	fi
 	@MODE_VAL="$(or $(MODE),unconstrained)"; \
-	set -m; LOG_PID=""; \
-	trap 'kill -- -$$LOG_PID 2>/dev/null; wait $$LOG_PID 2>/dev/null; true' EXIT INT TERM; \
+	LOG_PID=""; \
+	trap 'pkill -P $$LOG_PID 2>/dev/null; kill $$LOG_PID 2>/dev/null; wait $$LOG_PID 2>/dev/null; true' EXIT INT TERM; \
 	( docker compose --env-file .env -f $(DMAS_COMPOSE) logs -f --tail=0 memory benchmark 2>&1 \
 		| grep -E --line-buffered '\[(mem0|graphiti|cognee|rag) load\]|FullContext append|\[load\]|\[exp\] ' \
 		| sed -u 's/^/[svc] /' ) & LOG_PID=$$!; \
