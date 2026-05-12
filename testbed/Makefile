@@ -66,8 +66,12 @@ start: _check_docker _bootstrap_env_file _check_openai
 	@$(MAKE) _wait_benchmark
 	@echo "==> ready. Benchmark: $(BENCHMARK_URL)  Langfuse: $(LANGFUSE_URL)"
 
-# Stop everything. Volumes are preserved — use `clean` or `reset` to drop them.
+# Stop everything: kill the 'exp' tmux session (if running) so an attached
+# `make experiment` is torn down cleanly, then bring the compose stack
+# down. Volumes are preserved — use `clean` or `reset` to drop them.
 stop:
+	@echo "==> killing tmux session 'exp' (if any)"
+	tmux kill-session -t exp 2>/dev/null || true
 	docker compose --env-file .env -f $(DMAS_COMPOSE) down --remove-orphans || true
 
 # Wipe ONLY memory backend state (qdrant + neo4j). Langfuse history
@@ -79,11 +83,12 @@ clean: stop
 	@echo "==> dropping memory volumes: $(MEMORY_VOLUMES)"
 	docker volume rm $(MEMORY_VOLUMES) 2>/dev/null || true
 
-# Wipe everything: every named volume, plus top-level *.log files and any
-# files under experiments/results/ that aren't tucked away in backup/. The
-# three compose-managed networks (edge-net, cloud-net, mgmt-net) are torn
-# down by `compose down` in `stop` and re-created on the next `start`.
-# Move anything worth keeping into experiments/results/backup/ before running.
+# Wipe everything: `stop` first (which kills the 'exp' tmux session and
+# brings the compose stack down), then drop every named volume and remove
+# top-level *.log plus anything under experiments/results/ that isn't in
+# backup/. The three compose-managed networks (edge-net, cloud-net,
+# mgmt-net) are re-created on the next `start`. Move anything worth
+# keeping into experiments/results/backup/ before running.
 reset: stop
 	@echo "==> dropping all volumes: $(ALL_VOLUMES)"
 	docker volume rm $(ALL_VOLUMES) 2>/dev/null || true
@@ -376,6 +381,14 @@ experiment-test:
 # conversation in full, asks every question once, and lets the
 # LLM-as-judge panel run LLM_AS_JUDGE_SEED times per answer (default 3,
 # majority-vote). No KEEP_STATE — every leg starts on clean state.
+#
+# Auto-wraps in a tmux session named 'exp' on first invocation: SIGINT is
+# trapped so Ctrl+C inside the pane is a no-op, and stdout is teed to
+# exp_<backends-joined-by-underscore>.log. Detach with Ctrl-b d; re-run
+# the same command (or `tmux attach -t exp`) to re-attach. `make stop`
+# kills the session. Already inside tmux ($$TMUX set) → skips the wrap
+# and runs the sweep directly.
+#
 # Override CONVS, MODE, or BACKENDS to narrow:
 #   make experiment
 #   make experiment BACKENDS="mem0 graphiti"
@@ -383,7 +396,12 @@ experiment-test:
 #   make experiment MODE=unconstrained
 #   make experiment LLM_AS_JUDGE_SEED=5
 experiment:
-	@MODE_LIST="$(or $(MODE),unconstrained constrained)"; \
+	@if [ -z "$$TMUX" ]; then \
+		LOG_FILE="exp_$$(echo '$(BACKENDS)' | tr ' ' '_').log"; \
+		echo "==> launching tmux session 'exp' (log: $$LOG_FILE)"; \
+		exec tmux new -A -s exp "bash -c 'trap \"\" INT; $(MAKE) experiment $(MAKEOVERRIDES) 2>&1 | tee -a $$LOG_FILE'"; \
+	fi; \
+	MODE_LIST="$(or $(MODE),unconstrained constrained)"; \
 	for conv in $(CONVS); do \
 		for mode in $$MODE_LIST; do \
 			case "$$mode" in unconstrained|constrained) ;; *) \

@@ -4,35 +4,36 @@
 
 Each machine runs one slice of `BACKENDS`. `make experiment` with defaults
 covers all 10 LOCOMO conversations × both modes (unconstrained + constrained).
-Each command opens a tmux session named `exp`, streams logs live, and tees
-them to a log file. Detach with `Ctrl-b d`; re-run the same command to
-re-attach (`-A` attaches if the session already exists).
+It auto-launches a tmux session named `exp`, traps SIGINT so Ctrl+C inside
+the pane is a no-op, and tees output to `exp_<backends>.log`. Detach with
+`Ctrl-b d`; re-run the same command (or `tmux attach -t exp`) to re-attach.
 
 **Machine 1 (mem0)**
 ```bash
-tmux new -A -s exp "make experiment BACKENDS=mem0 2>&1 | tee -a exp_mem0.log"
+make experiment BACKENDS=mem0
 ```
 
 **Machine 2 (graphiti)**
 ```bash
-tmux new -A -s exp "make experiment BACKENDS=graphiti 2>&1 | tee -a exp_graphiti.log"
+make experiment BACKENDS=graphiti
 ```
 
 **Machine 3 (cognee)**
 ```bash
-tmux new -A -s exp "make experiment BACKENDS=cognee 2>&1 | tee -a exp_cognee.log"
+make experiment BACKENDS=cognee
 ```
 
 **Machine 4 (rag + full_context)**
 ```bash
-tmux new -A -s exp "make experiment BACKENDS='rag full_context' 2>&1 | tee -a exp_rag_fullctx.log"
+make experiment BACKENDS="rag full_context"
 ```
 
 Results land in `experiments/results/{backend}_{mode}.csv`.
 
 ## Cleaning up
 
-- `make stop` — bring the stack down, keep all state.
+- `make stop` — kill the `exp` tmux session (if any) and bring the stack
+  down. State is preserved.
 - `make clean` — stop + drop the memory backend volumes (qdrant, neo4j).
 - `make reset` — stop + drop every named volume + remove top-level `*.log`
   and every entry under `experiments/results/` except `backup/`. Move any
