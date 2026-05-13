@@ -40,6 +40,13 @@ COLUMNS = [
     "judge_trace_id",
     "phase",
     "memory", "mode", "conversation_index",
+    # Per-row resume aides (informational; resume key is still
+    # `question` which carries the global counter on load rows and the
+    # question text on ask rows). turn_index is the 0-based msg index
+    # within the session (set on load rows, blank on ask). question_index
+    # is the 1-based ordinal within the filtered question set for this
+    # leg (set on ask rows, blank on load).
+    "turn_index", "question_index",
     # Per-ask retrieval stats. Only set on `phase=ask` rows; load/warmup
     # rows leave these blank.
     #   memories_returned — sum of memory items the responder received
@@ -188,6 +195,49 @@ def already_done(memory: str, conv_index: int, latency: float, jitter: float,
         if q:
             done.add(q)
     return done
+
+
+def count_conv_rows(memory: str, conv_index: int, latency: float, jitter: float,
+                    bandwidth: float, name_prefix: str = "") -> tuple[int, int]:
+    """Return `(n_load, n_ask)` — count of load/ask rows for this conv in
+    the per-(memory, mode, prefix) CSV. Used by /experiment to decide
+    whether a leg is already complete vs. needs a fresh run.
+    Session-agnostic: any prior run's rows count.
+    """
+    n_load = n_ask = 0
+    for r in _iter_phase_rows(memory, conv_index, latency, jitter, bandwidth,
+                              name_prefix, phase="load", session_id=None):
+        n_load += 1
+    for r in _iter_phase_rows(memory, conv_index, latency, jitter, bandwidth,
+                              name_prefix, phase="ask", session_id=None):
+        n_ask += 1
+    return n_load, n_ask
+
+
+def purge_conv(memory: str, conv_index: int, latency: float, jitter: float,
+               bandwidth: float, name_prefix: str = "") -> int:
+    """Remove every row for `conv_index` from the per-(memory, mode, prefix)
+    CSV. Other convs sharing the file are preserved. Returns the number of
+    rows removed. Writes via tmpfile + atomic rename so a crash mid-purge
+    leaves the original file intact.
+    """
+    path = file_for_config(memory, latency, jitter, bandwidth, name_prefix)
+    if not path.exists() or path.stat().st_size == 0:
+        return 0
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    removed = 0
+    with path.open("r", newline="", encoding="utf-8") as src, \
+         tmp.open("w", newline="", encoding="utf-8") as dst:
+        reader = csv.DictReader(src)
+        writer = csv.DictWriter(dst, fieldnames=COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        for r in reader:
+            if r.get("conversation_index", "") == str(conv_index):
+                removed += 1
+                continue
+            writer.writerow(r)
+    os.replace(tmp, path)
+    return removed
 
 
 def loaded_messages(memory: str, conv_index: int, latency: float, jitter: float,

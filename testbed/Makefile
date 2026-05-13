@@ -84,18 +84,21 @@ clean: stop
 	docker volume rm $(MEMORY_VOLUMES) 2>/dev/null || true
 
 # Wipe everything: `stop` first (which kills the 'exp' tmux session and
-# brings the compose stack down), then drop every named volume and remove
-# top-level *.log plus anything under experiments/results/ that isn't in
-# backup/. The three compose-managed networks (edge-net, cloud-net,
-# mgmt-net) are re-created on the next `start`. Move anything worth
-# keeping into experiments/results/backup/ before running.
+# brings the compose stack down), then drop every named volume and
+# remove any top-level CSV under experiments/results/. Subfolders
+# (backup/, logs/, test-conv0/, test-smoke/, hand-curated archives, …)
+# are preserved — only the flat per-(backend, mode) CSVs the bench
+# writes at the top of experiments/results/ are removed. Run logs live
+# in experiments/results/logs/ and survive `reset`; delete them by hand
+# if you want a fresh log directory. The three compose-managed networks
+# (edge-net, cloud-net, mgmt-net) are re-created on the next `start`.
 reset: stop
 	@echo "==> dropping all volumes: $(ALL_VOLUMES)"
 	docker volume rm $(ALL_VOLUMES) 2>/dev/null || true
-	@echo "==> removing top-level *.log"
+	@echo "==> removing top-level *.log (legacy orphan logs; current logs live in experiments/results/logs/)"
 	rm -f *.log
-	@echo "==> removing experiments/results/* except backup/"
-	find experiments/results -mindepth 1 -maxdepth 1 ! -name backup -exec rm -rf {} +
+	@echo "==> removing top-level files in experiments/results/ (subfolders preserved)"
+	find experiments/results -mindepth 1 -maxdepth 1 -type f -delete
 
 # === checks ==============================================================
 
@@ -285,6 +288,14 @@ _wait_benchmark:
 # experiments/results/{prefix}{backend}_{mode}.csv (one file per
 # (framework, mode) — convs share a file, distinguished by the
 # `conversation_index` column and `experiment_name`).
+#
+# Resume is per-line and automatic: the bench searches the CSV for each
+# planned message (keyed on conv + within-conv counter) and each planned
+# question (keyed on conv + question text), and skips lines already
+# present. An already-complete leg is a graceful no-op; a partial leg
+# picks up where it stopped. Pass FORCE=1 to bypass per-line dedup and
+# append every line regardless (duplicates distinguished by session_id
+# and timestamp).
 #   make experiment-leg CONV=0 MODE=unconstrained
 #   make experiment-leg CONV=0 MODE=constrained LLM_AS_JUDGE_SEED=3 BACKENDS="mem0 graphiti"
 #   make experiment-leg CONV=0 MESSAGES=20 QUESTIONS=1   # load 20 msgs, ask 1 q
@@ -292,29 +303,14 @@ experiment-leg:
 	@if [ -z "$(CONV)" ]; then echo "CONV is required — pass CONV=<i>"; exit 2; fi
 	@MODE_VAL="$(or $(MODE),unconstrained)"; \
 	case "$$MODE_VAL" in unconstrained|constrained) ;; *) \
-		echo "MODE must be a single value (unconstrained|constrained) — got '$$MODE_VAL'"; exit 2 ;; esac; \
-	prefix="$(NAME_PREFIX)"; \
-	conflict=""; \
-	for backend in $(BACKENDS); do \
-		csv="experiments/results/$${prefix}$${backend}_$${MODE_VAL}.csv"; \
-		if [ -f "$$csv" ] && awk -F',' \
-			'NR==1{for(i=1;i<=NF;i++)if($$i=="conversation_index")col=i} \
-			 NR>1&&col&&$$col=="$(CONV)"{found=1;exit} \
-			 END{exit !found}' "$$csv" 2>/dev/null; then \
-			conflict="$$conflict $$csv"; \
-		fi; \
-	done; \
-	if [ -n "$$conflict" ]; then \
-		if [ -n "$(FORCE)" ]; then \
-			echo "WARNING: conv=$(CONV) already in:$$conflict  Proceeding (FORCE=1)."; \
-		else \
-			echo "ERROR: conv=$(CONV) already in:"; \
-			for f in $$conflict; do echo "  $$f"; done; \
-			echo "  Delete those files or pass FORCE=1 to proceed."; \
-			exit 1; \
-		fi; \
-	fi
+		echo "MODE must be a single value (unconstrained|constrained) — got '$$MODE_VAL'"; exit 2 ;; esac
 	@MODE_VAL="$(or $(MODE),unconstrained)"; \
+	LOG_DIR="experiments/results/logs"; \
+	mkdir -p "$$LOG_DIR"; \
+	BACKENDS_SLUG=$$(echo '$(BACKENDS)' | tr ' ' '_'); \
+	LOG_FILE="$$LOG_DIR/$(NAME_PREFIX)$${BACKENDS_SLUG}_conv$(CONV)_$${MODE_VAL}.log"; \
+	echo "==> leg log: $$LOG_FILE"; \
+	{ \
 	LOG_PID=""; \
 	trap 'pkill -P $$LOG_PID 2>/dev/null; kill $$LOG_PID 2>/dev/null; wait $$LOG_PID 2>/dev/null; true' EXIT INT TERM; \
 	( docker compose --env-file .env -f $(DMAS_COMPOSE) logs -f --tail=0 memory benchmark 2>&1 \
@@ -330,6 +326,7 @@ experiment-leg:
 	fi; \
 	if [ -n "$(Q_PER_TYPE)" ]; then extras="$$extras,\"q_per_type\":$(Q_PER_TYPE)"; fi; \
 	if [ -n "$(KEEP_STATE)" ]; then extras="$$extras,\"skip_post_reset\":true"; fi; \
+	if [ -n "$(FORCE)" ]; then extras="$$extras,\"force\":true"; fi; \
 	if [ -n "$(NAME_PREFIX)" ]; then extras="$$extras,\"name_prefix\":\"$(NAME_PREFIX)\""; fi; \
 	backends_json=$$(printf '"%s",' $(BACKENDS) | sed 's/,$$//'); \
 	body=$$(printf '{"conv":%s,"mode":"%s","llm_as_judge_seed":%s,"backends":[%s]%s}' \
@@ -338,7 +335,8 @@ experiment-leg:
 	curl -fsSN -X POST "$(BENCHMARK_URL)/experiment" \
 		-H "Content-Type: application/json" \
 		-d "$$body"; \
-	sleep 0.5
+	sleep 0.5; \
+	} 2>&1 | tee -a "$$LOG_FILE"
 
 # Calibration-as-test: load 119 messages and ask the first 3 questions
 # per category in 1-4 across BOTH network regimes (unconstrained +
@@ -397,9 +395,8 @@ experiment-test:
 #   make experiment LLM_AS_JUDGE_SEED=5
 experiment:
 	@if [ -z "$$TMUX" ]; then \
-		LOG_FILE="exp_$$(echo '$(BACKENDS)' | tr ' ' '_').log"; \
-		echo "==> launching tmux session 'exp' (log: $$LOG_FILE)"; \
-		exec tmux new -A -s exp "bash -c 'trap \"\" INT; $(MAKE) experiment $(MAKEOVERRIDES) 2>&1 | tee -a $$LOG_FILE'"; \
+		echo "==> launching tmux session 'exp' (per-leg logs in experiments/results/logs/)"; \
+		exec tmux new -A -s exp "bash -c 'trap \"\" INT; $(MAKE) experiment $(MAKEOVERRIDES)'"; \
 	fi; \
 	MODE_LIST="$(or $(MODE),unconstrained constrained)"; \
 	for conv in $(CONVS); do \

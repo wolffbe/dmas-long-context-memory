@@ -48,7 +48,8 @@ from opentelemetry.trace import format_trace_id
 from app.agents import post_ask, post_memorize, post_reset, post_warmup
 from app.judges import judge_majority
 from app.locomo_service import LocomoService
-from app.results import RESULTS_DIR, already_done, append_row, loaded_messages, file_for_config
+from app.results import (RESULTS_DIR, append_row, count_conv_rows,
+                         file_for_config, purge_conv)
 from shared.litellm_usage import usage_snapshot_async as litellm_usage_snapshot, diff as litellm_usage_diff
 from app.cgroup_metrics import snapshot as cgroup_snapshot, delta as cgroup_delta, wait_io_quiet as cgroup_wait_io_quiet, reset_peaks as cgroup_reset_peaks
 from app.toxics import apply_all, verify_all
@@ -135,6 +136,13 @@ class ExperimentRequest(BaseModel):
     # pre-leg reset is already resume-aware, so the load is paid once
     # and reused thereafter — useful for fast iteration on retrieval.
     skip_post_reset: bool = False
+    # When True, bypass per-line resume entirely: every planned message
+    # is loaded and every planned question is asked, even if the
+    # per-(backend, mode) CSV already has matching rows. Use when you
+    # intentionally want to append a fresh sample alongside prior runs;
+    # the resulting CSV will hold duplicates distinguished only by
+    # `session_id`, `timestamp`, and (for ask rows) `question_index`.
+    force: bool = False
     # Explicit session_id to resume INTO. When provided, the bench keys
     # resume on this session_id instead of auto-generating a fresh one,
     # so a re-run with the same id continues the existing run (skipping
@@ -178,6 +186,23 @@ def _toxics_for(mode: str) -> tuple[float, float, float]:
     if mode == "unconstrained":
         return 0.0, 0.0, 0.0
     raise ValueError(f"unexpected mode {mode!r}")
+
+
+def _expected_load_count(conv_idx: int, load_limit: int | None) -> int:
+    """Total messages the load phase will write for `conv_idx`, capped by
+    `load_limit` if set. Pairs with `count_conv_rows` for the per-leg
+    completeness check in /experiment.
+    """
+    conv = storage.get_conversation_by_index(conv_idx)
+    if conv is None:
+        return 0
+    total = 0
+    for k, msgs in conv.sessions.items():
+        if k.startswith("session_") and k[len("session_"):].isdigit():
+            total += len(msgs)
+    if load_limit is not None and load_limit > 0:
+        return min(total, load_limit)
+    return total
 
 
 def _session_date_for_question(conv, evidence: list | None) -> str:
@@ -497,6 +522,7 @@ async def _do_load(
                 # used by ask rows so the notebook's category→question_type
                 # mapping never sees session ordinals.
                 "seed": session_int,
+                "turn_index": mi,
                 "question": marker,
                 "answer": (m_evt.get("preview") or None),
                 "gold_answer": None,
@@ -669,51 +695,74 @@ async def experiment(req: ExperimentRequest, request: Request):
                                   "status": exc.status_code, "detail": str(exc.detail)[:300]}) + "\n"
                 continue
 
-            # Resume-aware reset: only wipe state when no messages have
-            # been saved yet for this (backend, conv, mode). On a partial
-            # resume, the storage on disk is the source of truth — wiping
-            # would discard the work the existing CSV rows attest to.
-            done_msgs = loaded_messages(backend, req.conv, latency, jitter, bandwidth,
-                                        req.name_prefix, session_id=session_id)
-            if not done_msgs:
-                try:
-                    pre = await post_reset(client, backend)
-                    yield json.dumps({"_phase": "reset_pre", "backend": backend, **pre}) + "\n"
-                except Exception as exc:
-                    yield json.dumps({"_phase": "reset_error", "when": "pre",
-                                      "backend": backend, "error": str(exc)[:300]}) + "\n"
-                    continue
+            # Per-leg completeness check. The CSV is the source of truth:
+            # if it already holds every planned load row AND every planned
+            # ask row for this (conv, backend, mode), the leg is done and
+            # we skip it entirely. Otherwise we purge any partial rows for
+            # this conv and run the leg from scratch (clean slate — no
+            # half-finished state lingering across runs). `force=True`
+            # bypasses the check so an explicit re-run always redoes the
+            # leg. Other convs sharing the file are preserved by purge.
+            expected_loads = _expected_load_count(req.conv, req.load_limit)
+            expected_asks = len(questions)
+            n_load, n_ask = count_conv_rows(backend, req.conv, latency, jitter, bandwidth,
+                                            req.name_prefix)
+            is_complete = (n_load >= expected_loads and n_ask >= expected_asks)
+            if is_complete and not req.force:
+                yield json.dumps({"_phase": "leg_complete_skipping",
+                                  "backend": backend, "conv": req.conv, "mode": req.mode,
+                                  "expected_loads": expected_loads,
+                                  "expected_asks": expected_asks,
+                                  "csv_loads": n_load, "csv_asks": n_ask}) + "\n"
+                yield json.dumps({"_phase": "backend_done", "backend": backend,
+                                  "emitted": 0, "skipped": expected_asks,
+                                  "reason": "complete"}) + "\n"
+                continue
 
-                # Reset memory.peak at the start of the constrained scenario
-                # so its peak is measured independently of the unconstrained
-                # run that preceded it on the same containers.
-                constrained_csv = file_for_config(backend, latency, jitter, bandwidth,
-                                                  req.name_prefix)
-                if latency > 0 and not constrained_csv.exists():
-                    await cgroup_reset_peaks()
+            removed = purge_conv(backend, req.conv, latency, jitter, bandwidth,
+                                 req.name_prefix)
+            if removed:
+                yield json.dumps({"_phase": "csv_purged", "backend": backend,
+                                  "conv": req.conv, "removed": removed,
+                                  "reason": "force" if req.force else "incomplete",
+                                  "expected_loads": expected_loads,
+                                  "expected_asks": expected_asks,
+                                  "had_loads": n_load, "had_asks": n_ask}) + "\n"
 
-                # Warmup — pay one-time backend init (graphiti index build,
-                # qdrant collection create) up front so it gets its own row
-                # instead of inflating row #1 of the load. Reset above
-                # guarantees a clean slate so the cost is honest per leg.
-                try:
-                    async for evt in _do_warmup(client, backend, req.conv, req.mode,
-                                                latency, jitter, bandwidth,
-                                                session_id,
-                                                name_prefix=req.name_prefix):
-                        yield json.dumps(evt) + "\n"
-                except Exception as exc:
-                    yield json.dumps({"_phase": "warmup_error", "backend": backend,
-                                      "error": str(exc)[:300]}) + "\n"
-            else:
-                yield json.dumps({"_phase": "reset_pre_skipped", "backend": backend,
-                                  "reason": "resuming",
-                                  "already_loaded": len(done_msgs)}) + "\n"
+            try:
+                pre = await post_reset(client, backend)
+                yield json.dumps({"_phase": "reset_pre", "backend": backend, **pre}) + "\n"
+            except Exception as exc:
+                yield json.dumps({"_phase": "reset_error", "when": "pre",
+                                  "backend": backend, "error": str(exc)[:300]}) + "\n"
+                continue
+
+            # Reset memory.peak at the start of the constrained scenario
+            # so its peak is measured independently of the unconstrained
+            # run that preceded it on the same containers.
+            constrained_csv = file_for_config(backend, latency, jitter, bandwidth,
+                                              req.name_prefix)
+            if latency > 0 and not constrained_csv.exists():
+                await cgroup_reset_peaks()
+
+            # Warmup — pay one-time backend init (graphiti index build,
+            # qdrant collection create) up front so it gets its own row
+            # instead of inflating row #1 of the load. Reset above
+            # guarantees a clean slate so the cost is honest per leg.
+            try:
+                async for evt in _do_warmup(client, backend, req.conv, req.mode,
+                                            latency, jitter, bandwidth,
+                                            session_id,
+                                            name_prefix=req.name_prefix):
+                    yield json.dumps(evt) + "\n"
+            except Exception as exc:
+                yield json.dumps({"_phase": "warmup_error", "backend": backend,
+                                  "error": str(exc)[:300]}) + "\n"
 
             # Load — one message per call, one row per message in the per-experiment CSV.
             try:
                 async for evt in _do_load(client, backend, req.conv, req.mode,
-                                          latency, jitter, bandwidth, done_msgs,
+                                          latency, jitter, bandwidth, set(),
                                           session_id,
                                           load_limit=req.load_limit,
                                           name_prefix=req.name_prefix):
@@ -725,8 +774,7 @@ async def experiment(req: ExperimentRequest, request: Request):
 
             # Ask. Each question is asked ONCE; only the LLM-as-judge
             # repeats `req.llm_as_judge_seed` times and majority-votes.
-            skip = already_done(backend, req.conv, latency, jitter, bandwidth,
-                                req.name_prefix, session_id=session_id)
+            skip: set[str] = set()
             conv_obj = storage.get_conversation_by_index(req.conv)
             n_emitted = n_skipped = 0
             for i, q in enumerate(questions, start=1):
@@ -887,6 +935,7 @@ async def experiment(req: ExperimentRequest, request: Request):
                     # number). Ask rows now run once per question, so
                     # leave the column null here.
                     "seed": None,
+                    "question_index": i,
                     "question": qtext,
                     "answer": answer,
                     "gold_answer": gold,

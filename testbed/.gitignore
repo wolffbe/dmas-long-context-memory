@@ -16,5 +16,6 @@ __pycache__/
 .Python
 
 .log
+experiments/results/logs/
 
 lib
