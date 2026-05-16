@@ -233,19 +233,33 @@ class RagService:
         return {"backend": "rag", "warmed": True, "collection": collection}
 
     def reset(self) -> Dict[str, Any]:
-        """Drop every rag_locomo_* collection in qdrant."""
+        """Drop every rag_locomo_* collection in qdrant, plus any
+        aliases that point at one — aliases survive collection
+        deletion otherwise."""
         deleted = 0
+        dropped_aliases = 0
         try:
             cols = self.qdrant.get_collections().collections
             for c in cols:
                 if c.name.startswith("rag_locomo_"):
                     self.qdrant.delete_collection(c.name)
                     deleted += 1
+            try:
+                for a in self.qdrant.get_aliases().aliases:
+                    if a.collection_name.startswith("rag_locomo_"):
+                        try:
+                            self.qdrant.delete_collection_alias(a.alias_name)
+                            dropped_aliases += 1
+                        except Exception:
+                            logger.exception("rag reset: drop alias %s failed", a.alias_name)
+            except Exception:
+                logger.exception("rag reset: list aliases failed")
         except Exception:
             logger.exception("rag reset: qdrant cleanup failed")
         self.run_id = uuid.uuid4().hex[:8]
         self.current_collection = None
-        return {"backend": "rag", "deleted": deleted}
+        return {"backend": "rag", "deleted": deleted,
+                "qdrant_aliases_dropped": dropped_aliases}
 
     def remember(self, question: str) -> List[str]:
         if not self.current_collection:

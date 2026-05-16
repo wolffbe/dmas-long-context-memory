@@ -316,8 +316,11 @@ class Mem0Service:
         /memorize call starts on empty state. Mem0 hard-codes the
         collection name to `mem0` (configurable via
         MemoryConfig.collection_name, but we keep
-        the default), so wiping it is the cleanest way to start fresh."""
+        the default), so wiping it is the cleanest way to start fresh.
+        Also drop any aliases pointing at mem0 collections — aliases
+        survive collection deletion otherwise."""
         deleted = False
+        dropped_aliases = 0
         try:
             from qdrant_client import QdrantClient
             qc = QdrantClient(
@@ -328,13 +331,24 @@ class Mem0Service:
                 if qc.collection_exists(name):
                     qc.delete_collection(name)
                     deleted = True
+            try:
+                for a in qc.get_aliases().aliases:
+                    if a.collection_name in ("mem0", "mem0migrations"):
+                        try:
+                            qc.delete_collection_alias(a.alias_name)
+                            dropped_aliases += 1
+                        except Exception:
+                            logger.exception("mem0 reset: drop alias %s failed", a.alias_name)
+            except Exception:
+                logger.exception("mem0 reset: list aliases failed")
         except Exception:
             logger.exception("mem0 reset: qdrant collection drop failed")
         # Re-instantiate Memory so it lazily recreates collections on next add.
         self.memory = Memory(self._build_config())
         self.run_id = uuid.uuid4().hex[:8]
         self.current_user_id = None
-        return {"backend": "mem0", "deleted": deleted}
+        return {"backend": "mem0", "deleted": deleted,
+                "qdrant_aliases_dropped": dropped_aliases}
 
     def remember(self, question: str) -> List[str]:
         if not self.current_user_id:

@@ -11,27 +11,20 @@ model_list:
       input_cost_per_token: 0
       output_cost_per_token: 0
 
-  # Two deployments per model_name → router treats them as a pool and
-  # rotates onto the backup key on 429. OPENAI_API_KEY_BACKUP defaults
-  # to OPENAI_API_KEY in docker-compose, so the second deployment is
-  # always reachable (redundant when no real backup is set).
+  # Single deployment per model. The responder catches 429s and waits
+  # using OpenAI's x-ratelimit-reset-* headers (see
+  # responder_service.py:_chat_with_retry), so litellm does NOT need a
+  # backup-key pool — failing over to a smaller-tier backup turned out
+  # to be worse than letting OpenAI's own rate-limit window expire.
   - model_name: gpt-4o-mini
     litellm_params:
       model: openai/gpt-4o-mini
       api_key: os.environ/OPENAI_API_KEY
-  - model_name: gpt-4o-mini
-    litellm_params:
-      model: openai/gpt-4o-mini
-      api_key: os.environ/OPENAI_API_KEY_BACKUP
 
   - model_name: text-embedding-3-small
     litellm_params:
       model: openai/text-embedding-3-small
       api_key: os.environ/OPENAI_API_KEY
-  - model_name: text-embedding-3-small
-    litellm_params:
-      model: openai/text-embedding-3-small
-      api_key: os.environ/OPENAI_API_KEY_BACKUP
 
 litellm_settings:
   drop_params: true
@@ -49,11 +42,12 @@ litellm_settings:
   success_callback: ["otel", "prometheus"]
   failure_callback: ["otel", "prometheus"]
   redact_user_api_key_info: true
-  # retry_after=0 + cooldown_time=0 (router_settings) → no artificial
-  # delay between primary/backup alternations. Upstream `Retry-After`
-  # is still honoured per-deployment.
-  num_retries: 1470
-  retry_after: 0
+  # num_retries: 0 — let the responder handle 429s directly. It reads
+  # OpenAI's x-ratelimit-reset-{requests,tokens} headers and sleeps the
+  # exact window, then retries. This lets the benchmark report retry
+  # wait time as a separate column (cloud_llm_retry_wait_ms) so the
+  # latency analysis can subtract throttle waits from compute time.
+  num_retries: 0
   request_timeout: 600
 
 router_settings:

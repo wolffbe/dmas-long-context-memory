@@ -277,17 +277,66 @@ class GraphitiService:
         return summary
 
     async def reset_async(self) -> Dict[str, Any]:
-        """Wipe every node + relationship from Neo4j so the next /memorize
-        starts on a clean graph. We drop the whole graph rather than
-        per-group_id because graphiti's indexes are global."""
+        """Wipe every API-reachable piece of Neo4j state without
+        restarting the container: nodes + relationships + indexes +
+        constraints, then clear the query plan cache and force a WAL
+        checkpoint so transaction logs flush to store files. This is
+        the deepest cleanup neo4j exposes via cypher; the only state
+        that survives is the empty store-file allocations themselves
+        (neo4j doesn't deallocate pages without restart, but the data
+        in them is gone).
+
+        The subsequent warmup re-runs `build_indices_and_constraints`
+        to put the schema back."""
         try:
             await self.graphiti.driver.execute_query("MATCH (n) DETACH DELETE n")
         except Exception:
             logger.exception("graphiti reset: DETACH DELETE failed")
             return {"backend": "graphiti", "deleted": False}
+
+        dropped_idx = dropped_con = 0
+        try:
+            rows, _, _ = await self.graphiti.driver.execute_query("SHOW INDEXES YIELD name")
+            for r in rows:
+                name = r["name"]
+                try:
+                    await self.graphiti.driver.execute_query(f"DROP INDEX `{name}` IF EXISTS")
+                    dropped_idx += 1
+                except Exception:
+                    logger.exception("graphiti reset: DROP INDEX %s failed", name)
+        except Exception:
+            logger.exception("graphiti reset: SHOW INDEXES failed")
+        try:
+            rows, _, _ = await self.graphiti.driver.execute_query("SHOW CONSTRAINTS YIELD name")
+            for r in rows:
+                name = r["name"]
+                try:
+                    await self.graphiti.driver.execute_query(f"DROP CONSTRAINT `{name}` IF EXISTS")
+                    dropped_con += 1
+                except Exception:
+                    logger.exception("graphiti reset: DROP CONSTRAINT %s failed", name)
+        except Exception:
+            logger.exception("graphiti reset: SHOW CONSTRAINTS failed")
+
+        # Drop cached query plans and flush WAL -> store files. Closest
+        # we can get to a volume wipe without restarting the container.
+        try:
+            await self.graphiti.driver.execute_query("CALL db.clearQueryCaches()")
+        except Exception:
+            logger.exception("graphiti reset: clearQueryCaches failed")
+        try:
+            await self.graphiti.driver.execute_query("CALL db.checkpoint()")
+        except Exception:
+            logger.exception("graphiti reset: checkpoint failed")
+
+        # Force a re-init on next memorize so build_indices_and_constraints
+        # runs again — the existing _initialized guard would otherwise
+        # skip schema rebuild after we just dropped it.
+        self._initialized = False
         self.current_group_id = None
-        # Indexes survive the data wipe; no need to rebuild.
-        return {"backend": "graphiti", "deleted": True}
+        return {"backend": "graphiti", "deleted": True,
+                "indexes_dropped": dropped_idx,
+                "constraints_dropped": dropped_con}
 
     async def remember_async(self, question: str) -> List[str]:
         """Mirror Zep's zep_locomo_search.py verbatim:

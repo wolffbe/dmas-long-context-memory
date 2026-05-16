@@ -2,12 +2,64 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
+import time
 from dataclasses import dataclass, field
 
 from openai import OpenAI, RateLimitError
 
 from app.prompts import judge as judge_prompts
+
+logger = logging.getLogger(__name__)
+
+# Parses OpenAI's `x-ratelimit-reset-*` header values ("1s", "6m0s",
+# "500ms", "1h2m3s"). Mirrors responder_service._parse_reset_duration —
+# kept here so the judge doesn't depend on the responder package.
+_DURATION_RE = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?$")
+
+
+def _parse_reset_duration(s: str | None) -> float:
+    if not s:
+        return 0.0
+    s = s.strip().lower()
+    if s.endswith("ms"):
+        try:
+            return float(s[:-2]) / 1000.0
+        except ValueError:
+            return 0.0
+    m = _DURATION_RE.fullmatch(s)
+    if not m:
+        return 0.0
+    h, mn, sec = m.groups()
+    return int(h or 0) * 3600 + int(mn or 0) * 60 + float(sec or 0)
+
+
+def _retry_wait_seconds(err: RateLimitError) -> float:
+    """Use OpenAI's `x-ratelimit-reset-{requests,tokens}` headers (the
+    longer of the two, plus a 100 ms buffer). Falls back to
+    `retry-after`, then 5 s, so we never spin."""
+    headers = {}
+    try:
+        headers = dict(getattr(err.response, "headers", {}) or {})
+    except Exception:
+        pass
+    waits = []
+    for h in ("x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"):
+        v = headers.get(h) or headers.get(h.title())
+        if v:
+            waits.append(_parse_reset_duration(v))
+    ra = headers.get("retry-after") or headers.get("Retry-After")
+    if ra:
+        try:
+            waits.append(float(ra))
+        except ValueError:
+            pass
+    return (max(waits) + 0.1) if waits else 5.0
+
+
+_MAX_RETRIES = int(os.getenv("JUDGE_MAX_RETRIES", "20"))
 
 
 @dataclass
@@ -36,45 +88,20 @@ class JudgeAggregate:
 
 
 # Judge bypasses litellm so its tokens stay out of the SUT /metrics
-# totals; this dual-client setup is the direct-OpenAI equivalent of
-# litellm's pool fallback.
-_clients: dict[str, OpenAI | None] = {"primary": None, "backup": None}
-_PING_PONG_ATTEMPTS = 4
+# totals. Single direct-OpenAI client; on 429 we sleep the exact
+# x-ratelimit-reset-* window from the response headers and retry.
+_client: OpenAI | None = None
 
 
-def _client_for(slot: str) -> OpenAI | None:
-    if _clients[slot] is not None:
-        return _clients[slot]
-    if slot == "primary":
+def _get_client() -> OpenAI:
+    global _client
+    if _client is None:
         if not os.getenv("OPENAI_API_KEY"):
-            return None
-        _clients[slot] = OpenAI()
-    else:
-        key = (os.getenv("OPENAI_API_KEY_BACKUP") or "").strip()
-        # docker-compose defaults OPENAI_API_KEY_BACKUP to OPENAI_API_KEY
-        # so the litellm pool stays healthy when no real backup is set;
-        # for the judge that means "same key twice", which would just
-        # double-hit the same rate limit. Treat dup as no backup.
-        primary_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-        if not key or key == primary_key:
-            return None
-        _clients[slot] = OpenAI(api_key=key)
-    return _clients[slot]
-
-
-def _client_chain() -> list[OpenAI]:
-    chain: list[OpenAI] = []
-    primary = _client_for("primary")
-    if primary is not None:
-        chain.append(primary)
-    backup = _client_for("backup")
-    if backup is not None:
-        chain.append(backup)
-    if not chain:
-        raise RuntimeError(
-            "OPENAI_API_KEY is not set; the judge cannot reach OpenAI."
-        )
-    return chain
+            raise RuntimeError(
+                "OPENAI_API_KEY is not set; the judge cannot reach OpenAI."
+            )
+        _client = OpenAI()
+    return _client
 
 
 def _grade_label(raw: str) -> tuple[str, str]:
@@ -96,11 +123,17 @@ def _grade_label(raw: str) -> tuple[str, str]:
 
 
 def _call(model: str, system: str, user: str) -> str:
-    """Judge completion with primary/backup ping-pong on 429."""
-    chain = _client_chain()
+    """Judge completion with 429-retry using OpenAI's reset headers.
+
+    On RateLimitError we read `x-ratelimit-reset-{requests,tokens}` from
+    the failing response and sleep `max(reset_requests, reset_tokens)
+    + 100 ms`. Tracks total slept time only inside this call — the
+    judge runs after `compute_ms` is recorded so its retry waits don't
+    contaminate per-row wall_ms.
+    """
+    client = _get_client()
     last_err: RateLimitError | None = None
-    for i in range(_PING_PONG_ATTEMPTS):
-        client = chain[i % len(chain)]
+    for attempt in range(_MAX_RETRIES):
         try:
             resp = client.chat.completions.create(
                 model=model,
@@ -114,8 +147,12 @@ def _call(model: str, system: str, user: str) -> str:
             return resp.choices[0].message.content or ""
         except RateLimitError as exc:
             last_err = exc
-            if len(chain) == 1:
-                break
+            wait_s = _retry_wait_seconds(exc)
+            logger.warning(
+                "judge: 429 from OpenAI; sleeping %.2fs (attempt %d/%d)",
+                wait_s, attempt + 1, _MAX_RETRIES,
+            )
+            time.sleep(wait_s)
     assert last_err is not None
     raise last_err
 

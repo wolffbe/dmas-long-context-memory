@@ -98,6 +98,25 @@ COLUMNS = [
     # prices the prompt slice through litellm's cost table for the
     # responder model (rate stays in lockstep with the proxy config).
     "responder_context_window_tokens", "responder_context_window_cost_usd",
+    # Total milliseconds the responder spent sleeping inside its
+    # `_chat_with_retry` helper to ride out OpenAI 429s on this row.
+    # The sleep duration is read from the failing response's
+    # `x-ratelimit-reset-{requests,tokens}` headers, so this is the
+    # exact throttle window OpenAI told us to wait. Not subtracted
+    # from compute_ms/wall_ms at write time — analysis subtracts it
+    # to get `effective_compute_ms` (the throttle-free view) while the
+    # raw columns preserve what the user actually waited. 0 on rows
+    # with no rate-limit retries (the typical case at Tier 3+).
+    #
+    # NOTE: the cpu/disk/network/ram counters above are NOT adjusted
+    # for retry-wait. During sleep the responder consumes ~0 of each
+    # (the OpenAI socket is closed; time.sleep blocks the thread), so
+    # its contribution to those cgroup counters is ~0 already. The only
+    # contamination is background work from other "cloud" cgroup-mates
+    # (langfuse-web, neo4j checkpoints, OTel heartbeats) during long
+    # retries — small enough that the raw counters remain accurate
+    # to within the noise floor of the measurement.
+    "cloud_llm_retry_wait_ms",
     "error",
 ]
 

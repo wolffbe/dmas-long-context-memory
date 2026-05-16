@@ -2,10 +2,40 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
+
+# Token budget for the JSON payload returned to the responder. The
+# responder feeds this through gpt-4o-mini (128k context). Subtract
+# responder overhead (system + date anchor + question + tool schema +
+# message wrappers ≈ 260–460 tok) and reply headroom (~1000 tok); a
+# 3000-token gap to the model boundary covers both with margin, so
+# overflow becomes structurally impossible regardless of question
+# length. Override via FULL_CONTEXT_MAX_TOKENS for a different model.
+MAX_PAYLOAD_TOKENS = int(os.getenv("FULL_CONTEXT_MAX_TOKENS", "125000"))
+
+# gpt-4o-mini uses o200k_base, NOT cl100k_base. Use the model-specific
+# encoder so our count matches what OpenAI's tokenizer will report on
+# the prompt — otherwise we'd over-count and truncate more than needed
+# (safe direction, but wastes context).
+try:
+    import tiktoken
+    _RESPONDER_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    try:
+        _enc = tiktoken.encoding_for_model(_RESPONDER_MODEL)
+    except KeyError:
+        _enc = tiktoken.get_encoding("o200k_base")
+    def _count_tokens(s: str) -> int:
+        return len(_enc.encode(s, disallowed_special=()))
+except Exception:
+    # Fallback when tiktoken isn't installed: ~3 chars per token is
+    # conservative for JSON. Better to truncate slightly more than to
+    # overflow the model.
+    def _count_tokens(s: str) -> int:
+        return len(s) // 3
 
 
 class FullContextService:
@@ -13,7 +43,12 @@ class FullContextService:
     verbatim. No LLM-driven extraction at memorize time, no retrieval at
     query time. The responder receives the full conversation JSON as its
     context and answers directly. Sets the lower bound on retention loss
-    (none) and the upper bound on per-question context size."""
+    (none) and the upper bound on per-question context size.
+
+    On `remember`, if the serialised conversation exceeds the responder
+    model's context window, the oldest turns are dropped until the
+    payload fits. The truncation marker is included in the returned
+    JSON so traces show exactly how many turns were sacrificed."""
 
     def __init__(self):
         self._conversations: dict[int, Dict[str, Any]] = {}
@@ -100,4 +135,66 @@ class FullContextService:
         data = self._conversations.get(self.current_conv_index)
         if not data:
             return []
-        return [json.dumps(data, ensure_ascii=False)]
+
+        serialized = json.dumps(data, ensure_ascii=False)
+        n_tokens = _count_tokens(serialized)
+        if n_tokens <= MAX_PAYLOAD_TOKENS:
+            return [serialized]
+
+        # Overflow path: compute per-turn token cost once, then drop
+        # exactly enough oldest turns to fit. Single pass — no iterative
+        # re-tokenization of the full payload.
+        work: Dict[str, Any] = {k: v for k, v in data.items()
+                                if k not in ("sessions", "session_datetimes")}
+        work["sessions"] = {sk: list(v) for sk, v in (data.get("sessions") or {}).items()}
+        work["session_datetimes"] = dict(data.get("session_datetimes") or {})
+
+        def _snum(k: str) -> int:
+            try:
+                return int(k.split("_", 1)[1])
+            except Exception:
+                return 0
+        keys = sorted(work["sessions"].keys(), key=_snum)
+
+        # Tokens to shed. Add a small safety margin (1%) — per-turn cost
+        # measured in isolation slightly undercounts the cost in-context
+        # because JSON separators between turns are not per-turn.
+        excess = n_tokens - MAX_PAYLOAD_TOKENS
+        target_drop = int(excess * 1.01) + 1
+
+        dropped_turns = 0
+        dropped_tokens = 0
+        while keys and dropped_tokens < target_drop:
+            sess = keys[0]
+            if work["sessions"][sess]:
+                turn = work["sessions"][sess].pop(0)
+                dropped_tokens += _count_tokens(json.dumps(turn, ensure_ascii=False))
+                dropped_turns += 1
+            else:
+                del work["sessions"][sess]
+                work["session_datetimes"].pop(sess, None)
+                keys.pop(0)
+
+        # One final verification. The per-turn-in-isolation estimate is
+        # tight in practice; this loop typically runs zero or one extra
+        # drop. Belt-and-suspenders so we never return an overflowing
+        # payload even if the estimate happened to undershoot.
+        while keys and _count_tokens(json.dumps(work, ensure_ascii=False)) > MAX_PAYLOAD_TOKENS:
+            sess = keys[0]
+            if work["sessions"][sess]:
+                work["sessions"][sess].pop(0)
+                dropped_turns += 1
+            else:
+                del work["sessions"][sess]
+                work["session_datetimes"].pop(sess, None)
+                keys.pop(0)
+
+        work["_truncated"] = {
+            "dropped_turns_from_oldest": dropped_turns,
+            "max_tokens": MAX_PAYLOAD_TOKENS,
+            "original_tokens": n_tokens,
+        }
+        final = json.dumps(work, ensure_ascii=False)
+        logger.info("FullContext truncate: conv=%d %d->%d tokens (dropped %d oldest turns)",
+                    self.current_conv_index, n_tokens, _count_tokens(final), dropped_turns)
+        return [final]

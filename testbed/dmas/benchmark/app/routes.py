@@ -804,6 +804,7 @@ async def experiment(req: ExperimentRequest, request: Request):
                 search_calls: int | None = None
                 responder_context_window_tokens: int | None = None
                 responder_context_window_cost_usd: float | None = None
+                cloud_llm_retry_wait_ms: float | None = None
                 # Detached root span: each ask.question gets its own
                 # trace_id; langfuse.session.id ties it to the same
                 # session as the load.message traces above.
@@ -843,6 +844,8 @@ async def experiment(req: ExperimentRequest, request: Request):
                             responder_context_window_tokens = int(resp["responder_context_window_tokens"])
                         if resp.get("responder_context_window_cost_usd") is not None:
                             responder_context_window_cost_usd = float(resp["responder_context_window_cost_usd"])
+                        if resp.get("cloud_llm_retry_wait_ms") is not None:
+                            cloud_llm_retry_wait_ms = float(resp["cloud_llm_retry_wait_ms"])
                     except Exception as exc:
                         err = str(exc)[:300]
                         # Mark the span as errored so Langfuse renders it
@@ -961,6 +964,7 @@ async def experiment(req: ExperimentRequest, request: Request):
                     "search_calls": search_calls,
                     "responder_context_window_tokens": responder_context_window_tokens,
                     "responder_context_window_cost_usd": responder_context_window_cost_usd,
+                    "cloud_llm_retry_wait_ms": cloud_llm_retry_wait_ms,
                     "error": err,
                 }
                 append_row(row)

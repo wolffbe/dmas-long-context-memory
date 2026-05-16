@@ -156,6 +156,7 @@ class CoordinatorService:
             "search_calls": resp.get("search_calls", 0),
             "responder_context_window_tokens": resp.get("responder_context_window_tokens"),
             "responder_context_window_cost_usd": resp.get("responder_context_window_cost_usd"),
+            "cloud_llm_retry_wait_ms": resp.get("cloud_llm_retry_wait_ms", 0.0),
             "trace_id": trace_id,
         }
 
@@ -258,4 +259,5 @@ class CoordinatorService:
                     "memories_returned": 0, "top_k": None, "search_calls": 0,
                     "responder_context_window_tokens": None,
                     "responder_context_window_cost_usd": None,
+                    "cloud_llm_retry_wait_ms": 0.0,
                     "trace_id": trace_id}

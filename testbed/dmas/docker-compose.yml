@@ -15,7 +15,6 @@ services:
       - ./litellm/config-edge.yaml:/app/config.yaml.tpl:ro
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_API_KEY_BACKUP=${OPENAI_API_KEY_BACKUP:-${OPENAI_API_KEY}}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
       - LANGFUSE_HOST=http://langfuse-web:3000
       - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
@@ -57,7 +56,6 @@ services:
       - ./litellm/config-cloud.yaml:/app/config.yaml.tpl:ro
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_API_KEY_BACKUP=${OPENAI_API_KEY_BACKUP:-${OPENAI_API_KEY}}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
       - LANGFUSE_HOST=http://langfuse-web:3000
       - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
@@ -317,7 +315,6 @@ services:
       - GATEWAY_CONTAINER=toxiproxy
       - EDGE_NET_CIDR=${EDGE_NET_SUBNET:-172.30.1.0/24}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_API_KEY_BACKUP=${OPENAI_API_KEY_BACKUP:-${OPENAI_API_KEY}}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
       - RESULTS_DIR=/results
       - CONSTRAINED_LATENCY_MS=150

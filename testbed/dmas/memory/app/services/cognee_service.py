@@ -294,19 +294,108 @@ class CogneeService:
         return summary
 
     async def reset_async(self) -> Dict[str, Any]:
-        """Drop everything cognee has persisted: graph data, vectors,
-        and its relational metadata. Note: this also wipes graphiti's
-        graph since they share Neo4j — fine because the benchmark
-        runs backends sequentially."""
+        """Drop everything cognee has persisted, then do a deeper
+        cleanup at the Neo4j + Qdrant layers so the next conversation
+        starts on as-clean storage as we can produce without restarting
+        the containers:
+          - cognee.prune.prune_data + prune_system(metadata=True)
+          - Neo4j: MATCH DETACH DELETE n, DROP every index/constraint,
+            clearQueryCaches, db.checkpoint
+          - Qdrant: drop every collection and alias not owned by
+            mem0/rag (the bench runs backends sequentially, so anything
+            else is residue from cognee/full_context).
+
+        Cognee shares Neo4j with Graphiti and Qdrant with Mem0/Rag —
+        the bench's sequential run ordering makes cross-backend cleanup
+        safe."""
         try:
             await cognee.prune.prune_data()
             await cognee.prune.prune_system(metadata=True)
         except Exception:
             logger.exception("cognee reset: prune failed")
             return {"backend": "cognee", "deleted": False}
+
+        dropped_idx = dropped_con = 0
+        try:
+            from neo4j import AsyncGraphDatabase
+            uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+            user = os.getenv("NEO4J_USER", "neo4j")
+            pw = os.getenv("NEO4J_PASSWORD", "password")
+            driver = AsyncGraphDatabase.driver(uri, auth=(user, pw))
+            try:
+                async with driver.session() as sess:
+                    await sess.run("MATCH (n) DETACH DELETE n")
+                    res = await sess.run("SHOW INDEXES YIELD name")
+                    idx_names = [r["name"] async for r in res]
+                    for name in idx_names:
+                        try:
+                            await sess.run(f"DROP INDEX `{name}` IF EXISTS")
+                            dropped_idx += 1
+                        except Exception:
+                            logger.exception("cognee reset: DROP INDEX %s failed", name)
+                    res = await sess.run("SHOW CONSTRAINTS YIELD name")
+                    con_names = [r["name"] async for r in res]
+                    for name in con_names:
+                        try:
+                            await sess.run(f"DROP CONSTRAINT `{name}` IF EXISTS")
+                            dropped_con += 1
+                        except Exception:
+                            logger.exception("cognee reset: DROP CONSTRAINT %s failed", name)
+                    # Cached query plans + checkpoint to flush WAL to
+                    # store files (closest to volume wipe without
+                    # restart).
+                    try:
+                        await sess.run("CALL db.clearQueryCaches()")
+                    except Exception:
+                        logger.exception("cognee reset: clearQueryCaches failed")
+                    try:
+                        await sess.run("CALL db.checkpoint()")
+                    except Exception:
+                        logger.exception("cognee reset: checkpoint failed")
+            finally:
+                await driver.close()
+        except Exception:
+            logger.exception("cognee reset: neo4j cleanup failed")
+
+        dropped_cols = dropped_aliases = 0
+        try:
+            from qdrant_client import QdrantClient
+            qc = QdrantClient(
+                host=os.getenv("QDRANT_HOST", "localhost"),
+                port=int(os.getenv("QDRANT_PORT", "6333")),
+            )
+            # Drop every collection not owned by mem0/rag. delete_collection
+            # removes segments, indexes, and WAL for that collection on
+            # disk — qdrant's strongest API-level wipe.
+            for c in qc.get_collections().collections:
+                n = c.name
+                if n in ("mem0", "mem0migrations") or n.startswith("rag_locomo_"):
+                    continue
+                try:
+                    qc.delete_collection(n)
+                    dropped_cols += 1
+                except Exception:
+                    logger.exception("cognee reset: qdrant delete_collection %s failed", n)
+            # Aliases survive collection deletion — sweep them too.
+            try:
+                for a in qc.get_aliases().aliases:
+                    try:
+                        qc.delete_collection_alias(a.alias_name)
+                        dropped_aliases += 1
+                    except Exception:
+                        logger.exception("cognee reset: drop alias %s failed", a.alias_name)
+            except Exception:
+                logger.exception("cognee reset: list aliases failed")
+        except Exception:
+            logger.exception("cognee reset: qdrant cleanup failed")
+
         self.current_dataset = None
         self.run_id = uuid.uuid4().hex[:8]
-        return {"backend": "cognee", "deleted": True}
+        return {"backend": "cognee", "deleted": True,
+                "indexes_dropped": dropped_idx,
+                "constraints_dropped": dropped_con,
+                "qdrant_collections_dropped": dropped_cols,
+                "qdrant_aliases_dropped": dropped_aliases}
 
     async def remember_async(self, question: str) -> List[str]:
         if not self.current_dataset:
