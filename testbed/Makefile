@@ -380,12 +380,14 @@ experiment-test:
 # LLM-as-judge panel run LLM_AS_JUDGE_SEED times per answer (default 3,
 # majority-vote). No KEEP_STATE — every leg starts on clean state.
 #
-# Auto-wraps in a tmux session named 'exp' on first invocation: SIGINT is
-# trapped so Ctrl+C inside the pane is a no-op, and stdout is teed to
-# exp_<backends-joined-by-underscore>.log. Detach with Ctrl-b d; re-run
-# the same command (or `tmux attach -t exp`) to re-attach. `make stop`
-# kills the session. Already inside tmux ($$TMUX set) → skips the wrap
-# and runs the sweep directly.
+# Auto-wraps in a detached tmux session named 'exp' on first invocation:
+# SIGINT is trapped so Ctrl+C inside the pane is a no-op, and per-leg
+# logs are written to experiments/results/logs/ regardless of attach
+# state. The makefile returns immediately after kicking the session off
+# — attach explicitly with `tmux attach -t exp` (detach again with
+# Ctrl-b d). Re-running `make experiment` while 'exp' is alive is a
+# no-op with a hint; `make stop` kills the session. Already inside tmux
+# ($$TMUX set) → skips the wrap and runs the sweep directly.
 #
 # Override CONVS, MODE, or BACKENDS to narrow:
 #   make experiment
@@ -395,8 +397,14 @@ experiment-test:
 #   make experiment LLM_AS_JUDGE_SEED=5
 experiment:
 	@if [ -z "$$TMUX" ]; then \
-		echo "==> launching tmux session 'exp' (per-leg logs in experiments/results/logs/)"; \
-		exec tmux new -A -s exp "bash -c 'trap \"\" INT; $(MAKE) experiment $(MAKEOVERRIDES)'"; \
+		if tmux has-session -t exp 2>/dev/null; then \
+			echo "==> tmux session 'exp' is already running — attach with 'tmux attach -t exp' (or 'make stop' to kill)"; \
+			exit 0; \
+		fi; \
+		echo "==> launching detached tmux session 'exp' (per-leg logs in experiments/results/logs/)"; \
+		tmux new-session -d -s exp "bash -c 'trap \"\" INT; $(MAKE) experiment $(MAKEOVERRIDES)'"; \
+		echo "==> session 'exp' started in background. Attach with: tmux attach -t exp"; \
+		exit 0; \
 	fi; \
 	MODE_LIST="$(or $(MODE),unconstrained constrained)"; \
 	for conv in $(CONVS); do \
