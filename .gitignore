@@ -1,5 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual envs
 venv/
 .venv/
-__pycache__/
-*.pyc
+env/
+lib/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+.checkpoints/
+
+# Secrets
 .env
+
+# Experiment artifacts
+*.log
+testbed/experiments/results/logs/

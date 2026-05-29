@@ -1,127 +1,78 @@
-# Cost and accuracy of long-term graph memory in distributed LLM-based multi-agent systems
+# Cost and accuracy of long-term memory in distributed LLM-based multi-agent systems
 
-[![arXiv](https://img.shields.io/badge/arXiv-2601.07978-b31b1b.svg)](https://arxiv.org/abs/2601.07978)
+This repository contains the testbed and the analysis used to produce the empirical results of the paper _Cost and accuracy of long-term memory in distributed multi-agent systems based on large language models_. The paper formulates the research questions, methodology, statistical tests, and discussion; this README only describes what the repository contains and where to find each artefact.
 
-A distributed multi-agent system testbed for benchmarking five long-term conversational memory strategies under different network scenarios. **See the [arXiv paper](https://arxiv.org/abs/2601.07978) for the research questions, methodology, statistical Pareto analysis, and full results.** This README only covers what the repo contains and how to run it.
+> The paper was submitted to **IEEE COMPSAC 2026**. A link to the publication will be added here once available.
 
-## Backends compared
+## Overview
 
-| Approach          | Library                                                    | Storage         |
-| ----------------- | ---------------------------------------------------------- | --------------- |
-| **mem0**          | [mem0](https://github.com/mem0ai/mem0) v2.0.2              | Qdrant          |
-| **Graphiti**      | [graphiti-core](https://github.com/getzep/graphiti) 0.29   | Neo4j           |
-| **Cognee**        | [cognee](https://github.com/topoteretes/cognee) 1.0.9      | Neo4j + Qdrant  |
-| **RAG**           | in-house `RagService`                                      | Qdrant          |
-| **Full Context**  | in-house `FullContextService`                              | (in-process)    |
+When LLM agents need to remember things across long conversations, they rely on a _long-term memory_ system. Several such systems exist, each with a different idea of how memories should be stored and searched. This repository measures how three of them, plus two simple baselines, compare on answer accuracy and operating cost. The benchmark is [LoCoMo](https://github.com/snap-research/locomo), the setting is a realistic cloud-edge deployment.
 
-Loading and retrieval mirror the upstream evaluation harnesses verbatim (`mem0ai/memory-benchmarks`, `getzep/zep-papers`). Evaluation uses the [LOCOMO benchmark](https://github.com/snap-research/locomo).
+| Name                                            | How it remembers                                      |
+| ----------------------------------------------- | ----------------------------------------------------- |
+| [cognee](https://github.com/topoteretes/cognee) | Graph plus vector embeddings, populated by an LLM     |
+| [Graphiti](https://github.com/getzep/graphiti)  | A temporal knowledge graph                            |
+| [Mem0](https://github.com/mem0ai/mem0)          | LLM-extracted facts in a vector store                 |
+| RAG _(baseline)_                                | Raw conversation turns in a vector store, no LLM step |
+| full-context _(baseline)_                       | The whole conversation, no compression at all         |
 
-## Quick start
+The paper asks whether the extra machinery of a memory framework actually buys better answers, and how that bet shifts when the link between the edge agent and the cloud becomes slow or constrained.
 
-Prereqs: Docker + Docker Compose, GNU Make, an OpenAI API key, ~12 GB RAM.
-
-```bash
-cd testbed
-cp .env.example .env          # set OPENAI_API_KEY=sk-...
-make build
-make start
-
-make experiment-test CONV=0   # smoke test
-make experiment               # full publishable sweep
-```
-
-On Linux/macOS, `sudo bash install.sh` from `testbed/` installs Make + Docker.
-
-### Smoke targets
-
-| Target                    | Messages | Questions    | Duration |
-| ------------------------- | -------- | ------------ | -------- |
-| `make experiment-test-s`  | 5        | 1 (cat 2)    | minutes  |
-| `make experiment-test`    | 119      | 3 × cats 1-4 | ~hour    |
-| `make experiment-test-l`  | 199      | 3 × cats 1-4 | hours    |
-
-All three sweep both network regimes for one `CONV` (default 0), reuse the load across regimes (`KEEP_STATE=1`), and run 1 judge call per answer. Narrow with `BACKENDS="mem0 graphiti"`.
-
-### Make targets
-
-| Command               | What it does                                                                                |
-| --------------------- | ------------------------------------------------------------------------------------------- |
-| `make build`          | Build every image from scratch. Aborts if `OPENAI_API_KEY` is missing.                      |
-| `make start`          | Bring the full stack up. Langfuse pk/sk auto-generated on first run.                        |
-| `make stop`           | Stop containers; volumes preserved.                                                          |
-| `make clean`          | Stop + drop only memory volumes (`qdrant-data`, `neo4j-data`, `neo4j-logs`).                |
-| `make reset`          | Stop + drop **every** named volume. Compose-managed bridges are torn down by `stop` and re-created on the next `start`. |
-| `make experiment`     | Full sweep: 10 LOCOMO convs × {unconstrained, constrained} × 5 backends × 3-judge majority. |
-| `make experiment-leg` | Single `(CONV, MODE)` × backends. Knobs: `CONV MODE BACKENDS QUESTIONS MESSAGES Q_PER_TYPE QUESTION_TYPES KEEP_STATE`. |
-| `make logs` / `ps`    | Tail logs / list containers.                                                                 |
-
-## Network partition
-
-Three compose bridges with a single gateway:
-
-- `edge-net` — `coordinator`, `ollama`, `litellm-edge`
-- `cloud-net` — `responder`, `memory`, `qdrant`, `neo4j`, `litellm-cloud`
-- `mgmt-net` — `benchmark`, `langfuse-*` (observability + orchestration, never on the data plane)
-
-`toxiproxy` is the sole container with a foot in both data subnets. Coordinator is the only caller that goes through it; responder↔memory and memory↔storage are direct on `cloud-net`.
-
-`make build` auto-picks a non-colliding /16 from a candidate list (172.30, 172.40, 10.42, 192.168.220, …) and pins the chosen subnets + toxiproxy IPs into `.env`. Pin manually by uncommenting the block in `.env.example`.
-
-## Network fault injection
-
-`unconstrained` clears all toxics; `constrained` applies `CONSTRAINED_LATENCY` / `CONSTRAINED_JITTER` / `CONSTRAINED_BANDWIDTH` (defaults 150 ms / 30 ms / 512 KB/s) to toxiproxy's memory + responder proxies — i.e. only the coordinator↔cloud flows. The bench re-verifies live toxic state mid-run and rejects with HTTP 412 on drift (`dmas/benchmark/app/toxics.py`).
-
-## Network metering
-
-Cross-boundary traffic is read at toxiproxy's `edge-net` veth: rx_bytes = edge→cloud (`network_edge_to_cloud_bytes`), tx_bytes = cloud→edge (`network_cloud_to_edge_bytes`). One chokepoint, no double-count, no intra-cloud inflation. CPU/RAM/disk are still summed per `group=edge|cloud` label (`dmas/benchmark/app/cgroup_metrics.py`).
-
-## Project structure
+## Repository layout
 
 ```
 dmas-memory/
-├── paper/                # Manuscript — published on arXiv: 2601.07978
-└── testbed/              # Runnable benchmark — `cd testbed` before any `make`
-    ├── dmas/
-    │   ├── benchmark/        # /experiment endpoint, judges, metrics, CSV writer
-    │   ├── coordinator/      # /ask handler with ollama tool-calling
-    │   ├── memory/           # mem0 + Graphiti + Cognee + RAG + FullContext
-    │   ├── responder/        # Final-answer generator
-    │   ├── shared/           # otel_init.py, litellm_usage.py, models.py
-    │   ├── litellm/{config-edge,config-cloud}.yaml
-    │   └── docker-compose.yml
+├── paper/                  # Manuscript sources
+└── testbed/                # Runnable benchmark (see testbed/README.md)
+    ├── dmas/                   # Coordinator, responder, memory, benchmark services
     ├── experiments/
-    │   ├── results.ipynb     # Reproduces every table and chart in the paper
-    │   └── results/          # Per-experiment CSVs ({prefix}{backend}_{mode}.csv)
+    │   ├── results/            # Per-experiment CSV outputs
+    │   └── analysis/
+    │       ├── results.ipynb       # Reproduces every table and figure of the paper
+    │       ├── requirements.txt    # Python dependencies for the notebook
+    │       └── figures/            # PDF figures emitted by the notebook
     ├── Makefile
     └── .env.example
 ```
 
-## Reproducing the paper
+The benchmark is a Docker Compose stack organised into edge, cloud, and management networks; full operational documentation is in [`testbed/README.md`](testbed/README.md).
 
-`experiments/results.ipynb` globs every `*.csv` under `experiments/results/` into one DataFrame and rebuilds every table and chart in the [paper](https://arxiv.org/abs/2601.07978) end-to-end. Each chapter renders a `constrained − unconstrained` Δ panel underneath its bar chart so the regime impact per backend is always visible.
+## Reproducing the analysis
+
+`testbed/experiments/analysis/results.ipynb` ingests every CSV under `testbed/experiments/results/` and rebuilds, end-to-end, every table and figure reported in the paper: macro retention metrics, retrieval-failure rates, per-category accuracy, the system-level cost decomposition per phase, total cost of ownership, the Pareto frontier, and the per-framework network sensitivity tests.
+
+```bash
+cd testbed/experiments/analysis
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+jupyter notebook results.ipynb
+```
+
+LaTeX strings for the cost and retention tables are printed in place; PDF figures are written to `figures/`.
+
+## Reproducing the experiments
+
+End-to-end execution of the benchmark (building the images, bringing up the stack, running the sweep that produces the CSVs consumed by the notebook above) is documented in [`testbed/README.md`](testbed/README.md), together with the network partitioning, fault-injection and metering details.
 
 ## Citation
 
-```bibtex
-@misc{wolff2026costaccuracylongtermmemory,
-      title={Cost and accuracy of long-term memory in Distributed Multi-Agent Systems based on Large Language Models},
-      author={Benedict Wolff and Jacopo Bennati},
-      year={2026},
-      eprint={2601.07978},
-      archivePrefix={arXiv},
-      primaryClass={cs.IR},
-      url={https://arxiv.org/abs/2601.07978},
-}
-```
+A BibTeX entry will be provided once the IEEE COMPSAC 2026 publication is available.
 
-LOCOMO benchmark dataset:
+LoCoMo benchmark dataset:
 
 ```bibtex
-@article{maharana2024evaluating,
-  title={Evaluating very long-term conversational memory of llm agents},
-  author={Maharana, Adyasha and Lee, Dong-Ho and Tulyakov, Sergey and Bansal, Mohit and Barbieri, Francesco and Fang, Yuwei},
-  journal={arXiv preprint arXiv:2402.17753},
-  year={2024}
+@inproceedings{maharana-etal-2024-evaluating,
+    title     = "Evaluating Very Long-Term Conversational Memory of {LLM} Agents",
+    author    = "Maharana, Adyasha and Lee, Dong-Ho and Tulyakov, Sergey and Bansal, Mohit and Barbieri, Francesco and Fang, Yuwei",
+    editor    = "Ku, Lun-Wei and Martins, Andre and Srikumar, Vivek",
+    booktitle = "Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)",
+    month     = aug,
+    year      = "2024",
+    address   = "Bangkok, Thailand",
+    publisher = "Association for Computational Linguistics",
+    url       = "https://aclanthology.org/2024.acl-long.747/",
+    doi       = "10.18653/v1/2024.acl-long.747",
+    pages     = "13851--13870"
 }
 ```
 
