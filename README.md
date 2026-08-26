@@ -1,8 +1,6 @@
 # Cost and accuracy of long-term memory in distributed LLM-based multi-agent systems
 
-This repository contains the testbed and the analysis used to produce the empirical results of the paper _Cost and accuracy of long-term memory in distributed multi-agent systems based on large language models_. The paper formulates the research questions, methodology, statistical tests, and discussion; this README only describes what the repository contains and where to find each artefact.
-
-> The paper was submitted to **IEEE COMPSAC 2026**. A link to the publication will be added here once available.
+This repository contains the testbed and the analysis used to produce the empirical results of the paper _Cost and Accuracy of Long-Term Memory in Distributed Multi-Agent Systems Based on Large Language Models_. The published paper can be found on [IEEE Xplore](https://ieeexplore.ieee.org/document/11645496). A preprint is available on [arXiv](https://arxiv.org/abs/2601.07978).
 
 ## Overview
 
