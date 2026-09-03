@@ -21,4 +21,4 @@ lib/
 
 # Experiment artifacts
 *.log
-testbed/experiments/results/logs/
+experiments/results/logs/

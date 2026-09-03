@@ -1,6 +1,6 @@
 # Testbed setup and execution
 
-This document covers building, starting, and operating the benchmark stack. Repository-level information (what the project is and how to reproduce the analysis) lives in the [top-level README](../README.md).
+This document covers building, starting, and operating the benchmark stack. Repository-level information (what the project is and how to reproduce the analysis) lives in the [top-level README](README.md).
 
 ## Prerequisites
 

@@ -20,27 +20,26 @@ The paper asks whether the extra machinery of a memory framework actually buys b
 
 ```
 dmas-memory/
-├── paper/                  # Manuscript sources
-└── testbed/                # Runnable benchmark (see testbed/README.md)
-    ├── dmas/                   # Coordinator, responder, memory, benchmark services
-    ├── experiments/
-    │   ├── results/            # Per-experiment CSV outputs
-    │   └── analysis/
-    │       ├── results.ipynb       # Reproduces every table and figure of the paper
-    │       ├── requirements.txt    # Python dependencies for the notebook
-    │       └── figures/            # PDF figures emitted by the notebook
-    ├── Makefile
-    └── .env.example
+├── dmas/                   # Coordinator, responder, memory, benchmark services
+├── experiments/
+│   ├── results/            # Per-experiment CSV outputs
+│   └── analysis/
+│       ├── results.ipynb       # Reproduces every table and figure of the paper
+│       ├── requirements.txt    # Python dependencies for the notebook
+│       └── figures/            # PDF figures emitted by the notebook
+├── Makefile
+├── TESTBED.md              # Benchmark setup and operation
+└── .env.example
 ```
 
-The benchmark is a Docker Compose stack organised into edge, cloud, and management networks; full operational documentation is in [`testbed/README.md`](testbed/README.md).
+The benchmark is a Docker Compose stack organised into edge, cloud, and management networks; full operational documentation is in [`TESTBED.md`](TESTBED.md).
 
 ## Reproducing the analysis
 
-`testbed/experiments/analysis/results.ipynb` ingests every CSV under `testbed/experiments/results/` and rebuilds, end-to-end, every table and figure reported in the paper: macro retention metrics, retrieval-failure rates, per-category accuracy, the system-level cost decomposition per phase, total cost of ownership, the Pareto frontier, and the per-framework network sensitivity tests.
+`experiments/analysis/results.ipynb` ingests every CSV under `experiments/results/` and rebuilds, end-to-end, every table and figure reported in the paper: macro retention metrics, retrieval-failure rates, per-category accuracy, the system-level cost decomposition per phase, total cost of ownership, the Pareto frontier, and the per-framework network sensitivity tests.
 
 ```bash
-cd testbed/experiments/analysis
+cd experiments/analysis
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 jupyter notebook results.ipynb
@@ -50,7 +49,7 @@ LaTeX strings for the cost and retention tables are printed in place; PDF figure
 
 ## Reproducing the experiments
 
-End-to-end execution of the benchmark (building the images, bringing up the stack, running the sweep that produces the CSVs consumed by the notebook above) is documented in [`testbed/README.md`](testbed/README.md), together with the network partitioning, fault-injection and metering details.
+End-to-end execution of the benchmark (building the images, bringing up the stack, running the sweep that produces the CSVs consumed by the notebook above) is documented in [`TESTBED.md`](TESTBED.md), together with the network partitioning, fault-injection and metering details.
 
 ## Citation
 
